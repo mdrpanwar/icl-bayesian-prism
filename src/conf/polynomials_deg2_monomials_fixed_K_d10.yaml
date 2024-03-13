@@ -1,0 +1,39 @@
+inherit: 
+    - base.yaml
+
+model:
+    n_dims: 10
+    n_positions: 130
+    pos_encode: True
+
+training:
+    task: polynomials_deg2_monomials_selection_unbiased
+    # "numDeg2Select" is the size of set S
+    # "sizeOfK" is the number of different S used in fixedK variant
+    # "variant" can be "fixedS" or "fixedK"
+    # "variant" and "numDeg2Select" are compulsory to be passed
+    #     "fixedS" is compulsory only if "variant" is "fixedS"
+    #     "sizeOfK" is compulsory only if "variant" is "fixedK"
+    # The random "fixedK" set is taken from the file src/KS_monomial_sets.py
+    task_kwargs: {"each_function_different_S": True, "variant": "fixedK", "numDeg2Select": 10, "sizeOfK": 100}
+    eval_ood: True # evaluate on a batch of random monomials too
+    log_model_norm: True
+    train_steps: 500001
+    eval_every_steps: 1000
+    curriculum:
+        dims:
+          start: 10
+          end: 10
+          inc: 0
+          interval : 1
+        points:
+          start: 125
+          end: 125
+          inc: 0
+          interval: 1
+
+out_dir: ../models/polynomials
+
+wandb:
+    name: "polynomials_deg2_monomials_selection_fixed_K_p125_d10_gaussian"
+

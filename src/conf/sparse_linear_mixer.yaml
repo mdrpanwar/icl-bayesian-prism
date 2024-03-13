@@ -1,0 +1,26 @@
+inherit: 
+    - base.yaml
+
+model:
+    n_dims: 20
+    pos_encode: False
+
+training:
+    task: sparse_linear_mixer
+    task_kwargs: {"mixing_ratio": 0.13}
+    curriculum:
+        dims:
+          start: 20
+          end: 20
+          inc: 0
+          interval : 1
+        points:
+            start: 41
+            end: 41
+            inc: 0
+            interval: 1
+
+out_dir: ../models/sparse_linear_mixer
+
+wandb:
+    name: "sparse_linear_mixer_013_wth_41ex"

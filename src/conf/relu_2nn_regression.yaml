@@ -1,0 +1,30 @@
+inherit: 
+    - base.yaml
+
+model:
+#     # n_positions: 201
+    pos_encode: False
+
+training:
+    task: relu_2nn_regression
+    task_kwargs: {"hidden_layer_size": 100}
+    # train_steps: 1000010
+    # k_steps_for_loss: "1"
+    # batch_size: 808
+    # num_accum_steps: 8
+    curriculum:
+        # dims:
+        #     start: 20
+        #     end: 20
+        #     inc: 1
+        #     interval: 2000
+        points:
+            start: 26
+            end: 101
+            inc: 5
+            interval: 2000
+
+out_dir: ../models/relu_2nn_regression
+
+wandb:
+    name: "2NN_d20_p101_1M_ga_k1_gcr"

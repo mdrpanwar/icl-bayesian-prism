@@ -1,0 +1,48 @@
+inherit: 
+    - base.yaml
+
+model:
+    family: gpt2
+    n_head: 2
+    n_layer: 8
+    n_embd: 128
+    n_dims: 8
+    n_positions: 101
+
+training:
+    task: noisy_lr_task_diversity
+    data: gaussian
+    data_kwargs: {
+                  "data_seed": 123456789124, 
+                "data_scale": 1.0}
+    task_kwargs: {"noise_scale": 0.5, 
+                "task_seed": 123456789125, 
+                "noise_seed": 123456789126, 
+                "task_scale": 1.0}
+    num_tasks: 128
+    batch_size: 256
+    learning_rate: 0.001
+    eval_every_steps: 1000
+    save_every_steps: 10000
+    keep_every_steps: 50000
+    train_steps: 500001
+    schedule: triangle
+    warmup_steps: 250_000
+    eval_ood: True
+    log_model_norm: True
+    curriculum:
+        dims:
+            start: 8
+            end: 8
+            inc: 0
+            interval: 1
+        points:
+            start: 16
+            end: 16
+            inc: 0
+            interval: 1    
+
+out_dir: ../models/noisy_lr_task_diversity
+
+wandb:
+    name: "noisy_lr_task_diversity_standard"

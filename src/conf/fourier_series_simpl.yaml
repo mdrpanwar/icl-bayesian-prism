@@ -1,0 +1,33 @@
+inherit: 
+    - base.yaml
+
+model:
+    n_dims: 1
+    pos_encode: False
+    n_layer : 12
+    n_head : 8
+    n_embd : 256
+
+training:
+    task: fourier_series_mixture
+    data: uniform
+    data_kwargs: {"a" : -5, "b": 5}
+    # task_kwargs: {"min_degree": 1, "max_degree": 5, "standardize": True, "root_dist": "disjoint", "x_dist": "uniform", "root_dist_kwargs": {"a": -5, "b": 5}, "dist_kwargs": {"a": -5, "b": 5}}
+    task_kwargs: {"min_frequency": 1, "max_frequency": 10, "standardize": True, "L": 5}
+    eval_every_steps: 1000
+    save_every_steps: 10000
+    keep_every_steps: 10000
+    train_steps: 500000
+    curriculum:
+        points:
+            start: 43
+            end: 43
+            inc: 0
+            interval: 1
+
+
+
+out_dir: ../models/fourier_series_mixture
+
+wandb:
+    name: "fourier_series_mixture_no_curriculum"

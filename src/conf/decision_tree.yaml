@@ -1,0 +1,31 @@
+inherit: 
+    - base.yaml
+
+model:
+# #     n_positions: 201
+    pos_encode: False
+
+
+training:
+    task: decision_tree
+    task_kwargs: {"depth": 4}
+    # train_steps: 1000010
+    # k_steps_for_loss: "1"
+    # batch_size: 162
+    # num_accum_steps: 40
+    curriculum:
+        # dims:
+        #     start: 20
+        #     end: 20
+        #     inc: 1
+        #     interval: 2000
+        points:
+            start: 26
+            end: 101
+            inc: 5
+            interval: 2000
+
+out_dir: ../models/decision_tree
+
+wandb:
+    name: "decision_tree_standard"

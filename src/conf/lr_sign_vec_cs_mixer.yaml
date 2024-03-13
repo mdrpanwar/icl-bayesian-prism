@@ -1,0 +1,27 @@
+inherit: 
+    - base.yaml
+
+model:
+    n_dims: 20
+    pos_encode: True
+
+training:
+    task: two_task_mixer
+    task_kwargs: {"task1": "linear_regression", "task2": "sign_vec_cs","mixing_ratio": 0.5, "task_spec_params_dict":{"linear_regression" : {"normalize_outputs": True}, "sign_vec_cs" : {"normalize_outputs": True}}}
+    train_steps: 1000001
+    curriculum:
+        dims:
+            start: 5
+            end: 20
+            inc: 1
+            interval: 2000
+        points:
+            start: 11
+            end: 41
+            inc: 2
+            interval: 2000
+
+out_dir: ../models/two_task_mixer
+
+wandb:
+    name: "two_task_mixer_lr_sign_vec_cs_8heads_12layers_256emb_05mix_20dim_40points"

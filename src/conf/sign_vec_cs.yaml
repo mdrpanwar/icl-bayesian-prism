@@ -1,0 +1,21 @@
+inherit: 
+    - base.yaml
+
+model:
+    n_dims: 20
+    pos_encode: False
+
+training:
+    task: sign_vec_cs
+    train_steps: 500001
+    curriculum:
+        points:
+            start: 11
+            end: 41
+            inc: 2
+            interval: 2000
+
+out_dir: ../models/sign_vec_cs
+
+wandb:
+    name: "sign_vec_cs_no_posenc_curr"

@@ -1,0 +1,29 @@
+inherit: 
+    - base.yaml
+
+model:
+    n_dims: 20
+    n_positions: 300
+
+training:
+    task: polynomials_deg2_monomials_selection_unbiased
+    # "variant" and "numDeg2Select" are compulsory to be passed; "fixedS" is only needed if "variant" is "fixedS"
+    task_kwargs: {"variant": "fixedS", "numDeg2Select": 20, "fixedS": [[10, 15], [1, 11], [16, 16], [8, 10], [6, 8], [5, 7], [6, 12], [7, 17], [5, 8], [4, 15], [0, 5], [7, 13], [8, 17], [0, 16], [0, 8], [14, 18], [5, 11], [9, 13], [15, 16], [0, 9]]}
+    eval_ood: True # evaluate on a batch of random monomials too
+    curriculum:
+        dims:
+          start: 20
+          end: 20
+          inc: 0
+          interval : 1
+        points:
+          start: 290
+          end: 290
+          inc: 0
+          interval: 1
+
+out_dir: ../models/polynomials
+
+wandb:
+    name: "polynomials_deg2_monomials_selection_fixed_S_n_points290_n_dims20_gaussian"
+

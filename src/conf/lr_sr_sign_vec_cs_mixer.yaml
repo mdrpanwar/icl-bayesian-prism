@@ -1,0 +1,27 @@
+inherit: 
+    - base.yaml
+
+model:
+    n_dims: 20
+    pos_encode: True
+
+training:
+    task: three_task_mixer
+    task_kwargs: {"task1": "linear_regression", "task2": "sparse_linear_regression", "task3": "sign_vec_cs", "mixing_ratio": {"task1": 0.3333, "task2": 0.3333, "task3": 0.3334}, "task_spec_params_dict":{"sparse_linear_regression" : {"sparsity": 3, "normalize_outputs": True}, "linear_regression" : {"normalize_outputs": True}, "sign_vec_cs" : {"normalize_outputs": True}}}
+    train_steps: 1000001
+    curriculum:
+        dims:
+            start: 5
+            end: 20
+            inc: 1
+            interval: 2000
+        points:
+            start: 11
+            end: 41
+            inc: 2
+            interval: 2000
+
+out_dir: ../models/three_task_mixer
+
+wandb:
+    name: "three_task_mixer_lr_sr_sign_vec_cs_8heads_12layers_256emb_033_each_mix_20dim_20points"

@@ -1,0 +1,23 @@
+inherit: 
+    - base.yaml
+
+model:
+    n_dims: 20
+    n_positions: 201
+    pos_encode: True
+
+training:
+    task: two_task_mixer
+    task_kwargs: {"task1": "decision_tree", "task2": "relu_2nn_regression","mixing_ratio": 0.5, "task_spec_params_dict":{"relu_2nn_regression" : {"hidden_layer_size": 100, "normalize_outputs": True}, "decision_tree" : {"depth": 4}}}
+    train_steps: 500100
+    curriculum:
+        points:
+            start: 26
+            end: 101
+            inc: 5
+            interval: 2000
+
+out_dir: ../models/two_task_mixer
+
+wandb:
+    name: "sing_mixer_2NN_DT_05mix_d20_p101"

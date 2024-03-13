@@ -1,0 +1,37 @@
+inherit: 
+    - base.yaml
+
+model:
+    n_dims: 1
+    pos_encode: False
+    n_layer : 12
+    n_head : 8
+    n_embd : 256
+
+training:
+    task: fourier_series_multitask
+    task_kwargs: {"each_function_different_S": True, "max_frequency": 20, "standardize": True, "L": 5, "variant": "fixedK", "sizeOfS": 3, "sizeOfK": 100} # max sizeOfK = 1140
+    data: uniform
+    data_kwargs: {"a" : -5, "b": 5}
+    eval_ood: True
+    log_model_norm: True
+    eval_every_steps: 1000
+    save_every_steps: 10000
+    keep_every_steps: 50000
+    train_steps: 500001
+    curriculum:
+        dims:
+          start: 1
+          end: 1
+          inc: 0
+          interval: 1
+        points:
+          start: 83
+          end: 83
+          inc: 0
+          interval: 2000
+
+out_dir: ../models/fourier_series
+
+wandb:
+    name: "fourier_series_multitask_fixedK"

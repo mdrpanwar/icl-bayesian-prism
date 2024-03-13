@@ -1,0 +1,28 @@
+inherit: 
+    - medium.yaml
+
+model:
+    n_dims: 100
+    pos_encode: False
+
+training:
+    train_steps : 1000000
+    # resume_id: "7b65e37c-5d4a-4087-9bdd-7bcd723ed223"
+    task: low_rank_cs
+    task_kwargs: {"rank": 1}
+    curriculum:
+        dims:
+          start: 100
+          end: 100
+          inc: 0
+          interval : 1
+        points:
+            start: 100
+            end: 100
+            inc: 0
+            interval: 1
+
+out_dir: ../models/low_rank_cs
+
+wandb:
+    name: "low_rank_cs_1_rank"

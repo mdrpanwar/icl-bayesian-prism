@@ -1,0 +1,22 @@
+inherit: 
+    - base.yaml
+
+# model:
+#     n_dims: 20
+#     pos_encode: False
+#     n_head: 4
+
+training:
+    task: two_task_mixer
+    task_kwargs: {"task1": "linear_regression", "task2": "decision_tree","mixing_ratio": 0.5, "task_spec_params_dict":{"decision_tree" : {"depth": 4}, "linear_regression": {"normalize_outputs": True}}}
+    curriculum:
+        points:
+            start: 26
+            end: 101
+            inc: 5
+            interval: 2000
+
+out_dir: ../models/two_task_mixer
+
+wandb:
+    name: "two_task_mixer_LR_DT_05_mix_d20_p101"

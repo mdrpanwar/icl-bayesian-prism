@@ -1,0 +1,48 @@
+inherit: 
+    - base.yaml
+
+model:
+    n_dims: 1
+    pos_encode: False
+    n_layer : 12
+    n_head : 8
+    n_embd : 256
+
+training:
+    task: fourier_series
+    data: uniform
+    data_kwargs: {"a" : -5, "b": 5}
+    # task_kwargs: {"min_degree": 1, "max_degree": 5, "standardize": True, "root_dist": "disjoint", "x_dist": "uniform", "root_dist_kwargs": {"a": -5, "b": 5}, "dist_kwargs": {"a": -5, "b": 5}}
+    task_kwargs: {"max_frequency": 10, "standardize": True, "L": 5}
+    eval_every_steps: 1000
+    save_every_steps: 10000
+    keep_every_steps: 10000
+    train_steps: 500000
+    curriculum:
+        dims:
+          start: 1
+          end: 1
+          inc: 0
+          interval : 1
+        points:
+            start: 7
+            end: 43
+            inc: 4
+            interval: 2000
+        max_freq:
+            start: 1
+            end: 10
+            inc: 1
+            interval: 2000
+        rff_dim:
+          start: 1
+          end: 1
+          inc: 0
+          interval: 2000
+
+
+
+out_dir: ../models/fourier_series
+
+wandb:
+    name: "fourier_series_curriculum"
