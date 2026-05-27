@@ -1,21 +1,31 @@
-name: in-context-learning
+name: icl-metal
 channels:
-  - pytorch
   - defaults
 dependencies:
-  - pip=21.2.4
-  - python=3.8.12
-  - pytorch=1.11.0
+  - python=3.10
+  - pip
   - pip:
-    - jupyter==1.0.0
-    - matplotlib==3.5.2
-    - numpy==1.22.3
-    - pandas==1.4.2
-    - quinine==0.3.0
-    - scikit-learn==1.0.2
-    - seaborn==0.11.2
-    - tqdm==4.64.0
-    - transformers==4.17.0
-    - wandb==0.12.11
-    - xgboost==1.6.1
-    - protobuf==3.20.1
+    - --extra-index-url https://download.pytorch.org/whl/cu121
+    # Hard pins:
+    - torch==2.4.*           # torch.func.vmap/grad, SDPA
+    - transformers==4.46.*   # GPT-2 SDPA default (FA-2 dispatch on supported HW)
+    # quinine 0.3.0's transitive deps, relaxed so pip picks wheels:
+    - pyyaml
+    - Cerberus
+    - cytoolz
+    - funcy
+    - gin-config
+    - munch
+    - toposort
+    # everything else — let pip pick latest compatible:
+    - wandb
+    - numpy
+    - matplotlib
+    - pandas
+    - scikit-learn
+    - tqdm
+    - seaborn
+    - xgboost
+    - jupyter
+# NOTE: quinine itself is installed by setup_env.sh with --no-deps, since its
+# 0.3.0 metadata has stale strict pins (pyyaml==5.4) that don't build on py3.10.

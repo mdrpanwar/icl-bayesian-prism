@@ -6,6 +6,10 @@ model:
     n_dims: 20
     n_positions: 101
     pos_encode: True
+    # ICL training has no second-order grads, so SDPA's flash/efficient
+    # backends are safe and faster. meta_base.yaml overrides this to "eager"
+    # for second-order MAML.
+    attn_implementation: sdpa
 
 training:
     data: gaussian

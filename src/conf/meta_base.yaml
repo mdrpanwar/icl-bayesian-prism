@@ -1,0 +1,33 @@
+inherit:
+    - base.yaml
+
+model:
+    # Pair with meta.first_order:
+    #   first_order: false -> attn_implementation: eager  (second-order MAML;
+    #                                                      SDPA backward isn't
+    #                                                      twice-differentiable)
+    #   first_order: true  -> attn_implementation: sdpa   (FOMAML; SDPA dispatches
+    #                                                      FlashAttention internally)
+    attn_implementation: eager
+
+training:
+    batch_size: 8       # outer batch in train_meta.py is meta.meta_batch_size; this is unused but required by schema
+    learning_rate: 0.0001
+    train_steps: 100001
+    eval_every_steps: 1000
+    save_every_steps: 1000
+    keep_every_steps: 100000
+
+meta:
+    inner_lr: 0.01
+    num_inner_steps: 1
+    first_order: false
+    meta_batch_size: 64    # 64 * 500001 = 32M tasks, matched with ICL's batch_size * train_steps
+    num_query_points: 10
+    vary_support_size: match_curriculum
+    fixed_support_size: null
+    meta_eval_every_steps: 10000
+    meta_eval_stride: 1
+    meta_eval_num_tasks: 128
+    run_icl_style_eval: true
+    run_maml_style_eval: true

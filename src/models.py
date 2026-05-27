@@ -13,7 +13,7 @@ import os
 import torch.distributions.normal as tdn
 from samplers import sample_scale
 
-from base_models import TwoLayerNeuralNetwork, ThreeLayerNeuralNetwork, ParallelNetworks, GPT2ModelWOPosEncodings
+from base_models import TwoLayerNeuralNetwork, ThreeLayerNeuralNetwork, ParallelNetworks
 
 def build_model(conf):
     if conf.family == "gpt2":
@@ -25,6 +25,7 @@ def build_model(conf):
                 n_layer=conf.n_layer,
                 n_head=conf.n_head,
                 pos_encode=conf.pos_encode,
+                attn_implementation=conf.attn_implementation,
                 # resid_pdrop=conf.resid_pdrop,
                 # embd_pdrop=conf.embd_pdrop,
                 # attn_pdrop=conf.attn_pdrop,
@@ -109,7 +110,8 @@ def get_relevant_baselines(task_name):
 class TransformerModel(nn.Module):
     def __init__(
         self, n_dims, n_positions, n_embd=128, n_layer=12, n_head=4, pos_encode=True
-        ,resid_pdrop=0.0, embd_pdrop=0.0, attn_pdrop=0.0, use_cache=False
+        ,resid_pdrop=0.0, embd_pdrop=0.0, attn_pdrop=0.0, use_cache=False,
+        attn_implementation="eager",
     ):
         super(TransformerModel, self).__init__()
         configuration = GPT2Config(
@@ -121,6 +123,7 @@ class TransformerModel(nn.Module):
             embd_pdrop=embd_pdrop,
             attn_pdrop=attn_pdrop,
             use_cache=use_cache,
+            attn_implementation=attn_implementation,
         )
         self.name = (
             f"gpt2_embd={n_embd}_layer={n_layer}_head={n_head}_pos_encode{pos_encode}"
@@ -128,12 +131,31 @@ class TransformerModel(nn.Module):
 
         self.n_positions = n_positions
         self.n_dims = n_dims
+        self._pos_encode = pos_encode
         self._read_in = nn.Linear(n_dims, n_embd)
-        if pos_encode:
-            self._backbone = GPT2Model(configuration)
-        else:
-            self._backbone = GPT2ModelWOPosEncodings(configuration)
+        self._backbone = GPT2Model(configuration)
         self._read_out = nn.Linear(n_embd, 1)
+        self._apply_pos_encode_freeze()
+
+    def _apply_pos_encode_freeze(self):
+        # When pos_encode=False, we keep the wpe parameter (so the standard
+        # GPT2Model.forward path runs unchanged) but pin it to zero and freeze
+        # it, which makes `inputs_embeds + wpe(pos)` equivalent to the old
+        # GPT2ModelWOPosEncodings behaviour without an overridden forward.
+        if not self._pos_encode:
+            with torch.no_grad():
+                self._backbone.wpe.weight.zero_()
+            self._backbone.wpe.weight.requires_grad_(False)
+
+    def load_state_dict(self, state_dict, strict=True):
+        # Older transformers (<4.21) saved an `attn.masked_bias` buffer per
+        # layer that no longer exists; strip it so old checkpoints load cleanly.
+        state_dict = {
+            k: v for k, v in state_dict.items() if not k.endswith(".attn.masked_bias")
+        }
+        result = super().load_state_dict(state_dict, strict=strict)
+        self._apply_pos_encode_freeze()
+        return result
 
     @staticmethod
     def _combine(xs_b, ys_b):
@@ -613,14 +635,20 @@ class GDModel:
 
 
 class DecisionTreeModel:
-    def __init__(self, max_depth=None):
+    def __init__(self, max_depth=None, preprocess=None):
         self.max_depth = max_depth
-        self.name = f"decision_tree_max_depth={max_depth}"
+        self.preprocess = preprocess
+        preprocess_name = "" if preprocess is None else f"_preprocess={preprocess}"
+        self.name = f"decision_tree_max_depth={max_depth}{preprocess_name}"
 
     # inds is a list containing indices where we want the prediction.
     # prediction made at all indices by default.
     def __call__(self, xs, ys, inds=None):
         xs, ys = xs.cpu(), ys.cpu()
+        if self.preprocess == "sign":
+            xs = xs.sign()
+        elif self.preprocess is not None:
+            raise ValueError(f"Unknown preprocess: {self.preprocess}")
 
         if inds is None:
             inds = range(ys.shape[1])
@@ -652,13 +680,20 @@ class DecisionTreeModel:
 
 
 class XGBoostModel:
-    def __init__(self):
-        self.name = "xgboost"
+    def __init__(self, n_jobs=None, preprocess=None):
+        self.n_jobs = n_jobs
+        self.preprocess = preprocess
+        preprocess_name = "" if preprocess is None else f"_preprocess={preprocess}"
+        self.name = f"xgboost{preprocess_name}"
 
     # inds is a list containing indices where we want the prediction.
     # prediction made at all indices by default.
     def __call__(self, xs, ys, inds=None):
         xs, ys = xs.cpu(), ys.cpu()
+        if self.preprocess == "sign":
+            xs = xs.sign()
+        elif self.preprocess is not None:
+            raise ValueError(f"Unknown preprocess: {self.preprocess}")
 
         if inds is None:
             inds = range(ys.shape[1])
@@ -677,7 +712,7 @@ class XGBoostModel:
                 for j in range(ys.shape[0]):
                     train_xs, train_ys = xs[j, :i], ys[j, :i]
 
-                    clf = xgb.XGBRegressor()
+                    clf = xgb.XGBRegressor(n_jobs=self.n_jobs)
 
                     clf = clf.fit(train_xs, train_ys)
                     test_x = xs[j, i : i + 1]

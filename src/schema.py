@@ -24,6 +24,11 @@ model_schema = {
     "pos_encode": merge(tboolean, required),
     "load_model_path": merge(tstring, nullable, default(None)),
     "train_only_emb": merge(tboolean, default(False)),
+    # SDPA's fused backends don't implement double-backward, so second-order MAML
+    # needs eager. FOMAML / ICL can use sdpa to dispatch FlashAttention.
+    "attn_implementation": merge(
+        tstring, allowed(["eager", "sdpa"]), default("eager")
+    ),
 }
 
 curriculum_base_schema = {
@@ -111,8 +116,8 @@ training_schema = {
 }
 
 wandb_schema = {
-    "project": merge(tstring, default("in-context-training")),
-    "entity": merge(tstring, default("in-context")),
+    "project": merge(tstring, default("icl-metal")),
+    "entity": merge(tstring, nullable, default("mdrpanwar")),
     "notes": merge(tstring, default("")),
     "name": merge(tstring, nullable, default(None)),
     "log_every_steps": merge(tinteger, default(10)),
@@ -126,3 +131,26 @@ schema = {
     "test_run": merge(tboolean, default(False)),
     "is_save_task_pool": merge(tboolean, default(True)), # only applicable for task diversity task
 }
+
+# Meta-learning (MAML) schema. Used by train_meta.py.
+meta_schema = {
+    "inner_lr": merge(tfloat, default(0.01)),
+    "num_inner_steps": merge(tinteger, default(1)),
+    "first_order": merge(tboolean, default(False)),
+    "meta_batch_size": merge(tinteger, default(8)),
+    "num_query_points": merge(tinteger, default(10)),
+    "vary_support_size": merge(
+        tstring,
+        allowed(["match_curriculum", "full_range", "fixed"]),
+        default("match_curriculum"),
+    ),
+    "fixed_support_size": merge(tinteger, nullable, default(None)),
+    "meta_eval_every_steps": merge(tinteger, default(5000)),
+    "meta_eval_stride": merge(tinteger, default(1)),
+    "meta_eval_num_tasks": merge(tinteger, default(256)),
+    "run_icl_style_eval": merge(tboolean, default(True)),
+    "run_maml_style_eval": merge(tboolean, default(True)),
+}
+
+meta_training_schema = dict(schema)
+meta_training_schema["meta"] = stdict(meta_schema)

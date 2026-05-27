@@ -1,5 +1,5 @@
 wandb:
-    project: in-context-training
-    entity: your-entity
+    project: icl-metal
+    entity: mdrpanwar
     notes:
     log_every_steps: 100

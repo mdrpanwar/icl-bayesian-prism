@@ -1,0 +1,20 @@
+inherit:
+    - ../meta_base.yaml
+
+model:
+    pos_encode: False
+
+training:
+    task: decision_tree
+    task_kwargs: {"depth": 4}
+    curriculum:
+        points:
+            start: 26
+            end: 101
+            inc: 5
+            interval: 2000
+
+out_dir: ../models/meta_decision_tree
+
+wandb:
+    name: "meta_decision_tree"

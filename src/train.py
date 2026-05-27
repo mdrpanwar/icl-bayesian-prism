@@ -557,15 +557,23 @@ def main(args):
         curriculum_args.dims.start = curriculum_args.dims.end
         args.training.train_steps = 100
     else:
-        wandb.init(
+        wandb_entity = args.wandb.entity
+        if wandb_entity in (None, ""):
+            wandb_entity = None
+
+        wandb_init_kwargs = dict(
             dir=args.out_dir,
             project=args.wandb.project,
-            entity=args.wandb.entity,
+            id=args.training.resume_id,
             config=args.__dict__,
             notes=args.wandb.notes,
             name=args.wandb.name,
-            resume=True,
+            resume="allow",
         )
+        if wandb_entity is not None:
+            wandb_init_kwargs["entity"] = wandb_entity
+
+        wandb.init(**wandb_init_kwargs)
 
     model = build_model(args.model)
     if args.model.load_model_path is not None:
@@ -602,6 +610,7 @@ if __name__ == "__main__":
         if run_id is None:
             run_id = str(uuid.uuid4())
 
+        args.training.resume_id = run_id
         out_dir = os.path.join(args.out_dir, run_id)
         if not os.path.exists(out_dir):
             os.makedirs(out_dir)
