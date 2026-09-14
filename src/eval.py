@@ -4,6 +4,7 @@ import os
 import random
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from functools import wraps
 
 from munch import Munch
 import numpy as np
@@ -14,9 +15,42 @@ import yaml
 
 import models
 from meta_eval import eval_model_maml
+from meta_utils import (
+    INNER_LR_MODULE_NAME,
+    configure_inner_lrs,
+    get_inner_lrs,
+    load_state_dict_allow_missing_inner_lrs,
+)
 from samplers import get_data_sampler, sample_transformation
 from tasks import get_task_sampler, PolynomialsUnbiasedPoints, PolynomialsDegTwoMonomialSelectionUnbiased, NoisyLinearRegressionTaskDiversity, FourierSeriesV2Multitask
 import time
+
+
+def preserve_rng_state(func):
+    """Keep deterministic evaluation from perturbing the training RNG stream."""
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        python_state = random.getstate()
+        numpy_state = np.random.get_state()
+        torch_state = torch.get_rng_state()
+        cuda_states = (
+            torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        )
+        try:
+            return func(*args, **kwargs)
+        finally:
+            random.setstate(python_state)
+            np.random.set_state(numpy_state)
+            torch.set_rng_state(torch_state)
+            if cuda_states is not None:
+                torch.cuda.set_rng_state_all(cuda_states)
+
+    return wrapper
+
+
+def _checkpoint_map_location():
+    return None if torch.cuda.is_available() else torch.device("cpu")
+
 
 def get_model_from_run(run_path, step=-1, only_conf=False):
     config_path = os.path.join(run_path, "config.yaml")
@@ -26,28 +60,37 @@ def get_model_from_run(run_path, step=-1, only_conf=False):
         return None, conf
 
     model = models.build_model(conf.model)
+    if hasattr(conf, "meta"):
+        configure_inner_lrs(model, conf.meta)
 
     if step == -1:
         state_path = os.path.join(run_path, "state.pt")
-        state = torch.load(state_path)
-        model.load_state_dict(state["model_state_dict"])
+        state = torch.load(state_path, map_location=_checkpoint_map_location())
+        load_state_dict_allow_missing_inner_lrs(model, state["model_state_dict"])
     else:
         model_path = os.path.join(run_path, f"model_{step}.pt")
-        state_dict = torch.load(model_path)
-        model.load_state_dict(state_dict)
+        state_dict = torch.load(model_path, map_location=_checkpoint_map_location())
+        load_state_dict_allow_missing_inner_lrs(model, state_dict)
 
     return model, conf
 
 
 def load_into_model_from_run(model, run_path, step=-1, only_conf=False):
+    config_path = os.path.join(run_path, "config.yaml")
+    if os.path.exists(config_path):
+        with open(config_path) as fp:
+            conf = Munch.fromDict(yaml.safe_load(fp))
+        if hasattr(conf, "meta"):
+            configure_inner_lrs(model, conf.meta)
+
     if step == -1:
         state_path = os.path.join(run_path, "state.pt")
-        state = torch.load(state_path)
-        model.load_state_dict(state["model_state_dict"])
+        state = torch.load(state_path, map_location=_checkpoint_map_location())
+        load_state_dict_allow_missing_inner_lrs(model, state["model_state_dict"])
     else:
         model_path = os.path.join(run_path, f"model_{step}.pt")
-        state_dict = torch.load(model_path)
-        model.load_state_dict(state_dict)
+        state_dict = torch.load(model_path, map_location=_checkpoint_map_location())
+        load_state_dict_allow_missing_inner_lrs(model, state_dict)
 
     return model
 
@@ -189,7 +232,10 @@ def eval_model_batch(model, kwargs, seed=None):
     n_points = kwargs["n_points"]
     batch_size = kwargs["batch_size"]
     prompting_strategy = kwargs["prompting_strategy"]
-    data_sampler_kwargs = kwargs.get("data_sampler_kwargs", {})
+    data_sampler_kwargs = dict(kwargs.get("data_sampler_kwargs", {}))
+    if seed is not None and data_name == "gaussian":
+        # Each evaluation batch gets a deterministic, method-independent x set.
+        data_sampler_kwargs["data_seed"] = seed
     task_sampler_kwargs = kwargs.get("task_sampler_kwargs", {})
     excess_tensors_eval = kwargs.get("excess_tensors_eval")
     eval_ood = kwargs.get("eval_ood", False)
@@ -226,6 +272,8 @@ def eval_model_batch_worker(args):
     return batch_idx, eval_model_batch(model, kwargs, seed=base_seed + batch_idx)
 
 
+
+@preserve_rng_state
 def eval_model(
     model,
     task_name,
@@ -303,7 +351,9 @@ def eval_model(
 
 def build_evals(conf):
     n_dims = conf.model.n_dims
-    n_points = conf.training.curriculum.points.end
+    n_points = getattr(conf.training, "eval_n_points", None)
+    if n_points is None:
+        n_points = conf.training.curriculum.points.end
     batch_size = conf.training.batch_size
 
     task_name = conf.training.task
@@ -326,6 +376,11 @@ def build_evals(conf):
             "prompting_strategy": "standard",
             "eval_mode": "maml",
             "inner_lr": conf.meta.inner_lr,
+            "inner_lr_mode": getattr(conf.meta, "inner_lr_mode", "fixed"),
+            "inner_lr_parameterization": getattr(
+                conf.meta, "inner_lr_parameterization", "direct"
+            ),
+            "inner_lr_bound": getattr(conf.meta, "inner_lr_bound", None),
             "num_inner_steps": conf.meta.num_inner_steps,
             "stride": conf.meta.meta_eval_stride,
         }
@@ -392,6 +447,22 @@ def compute_eval_metrics(model, kwargs):
     if eval_mode == "maml":
         if isinstance(model, torch.nn.Module):
             kwargs.pop("prompting_strategy")
+            if hasattr(model, INNER_LR_MODULE_NAME):
+                inner_lr_config = {
+                    "inner_lr_mode": kwargs.pop("inner_lr_mode", "learned_per_param"),
+                    "inner_lr": kwargs["inner_lr"],
+                    "inner_lr_parameterization": kwargs.pop(
+                        "inner_lr_parameterization", "direct"
+                    ),
+                    "inner_lr_bound": kwargs.pop("inner_lr_bound", None),
+                }
+                kwargs["inner_lrs"] = get_inner_lrs(
+                    model,
+                    inner_lr_config,
+                )
+            kwargs.pop("inner_lr_mode", None)
+            kwargs.pop("inner_lr_parameterization", None)
+            kwargs.pop("inner_lr_bound", None)
             return eval_model_maml(model, **kwargs)
         kwargs.pop("inner_lr")
         kwargs.pop("num_inner_steps")
@@ -449,7 +520,8 @@ def get_run_metrics(
         all_models = []
     else:
         model, conf = get_model_from_run(run_path, step)
-        model = model.cuda().eval()
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = model.to(device).eval()
         all_models = [model]
         if not skip_baselines:
             if baseline_models is None:

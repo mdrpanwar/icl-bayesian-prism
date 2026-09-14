@@ -1,0 +1,42 @@
+inherit:
+    - ../meta_base.yaml
+
+# Smaller transformer for cheaper multi-step inner-loop MAML experiments.
+# Current full model is 12 layers, 256 hidden dim, 8 heads.
+model:
+    pos_encode: False
+    n_embd: 128
+    n_layer: 4
+    n_head: 4
+    # Eager is fastest/reliable for this MAML path: support/query prompts are
+    # length 1, and fused SDPA does not compose well with functorch vmap here.
+    attn_implementation: eager
+
+training:
+    task: linear_regression
+    curriculum:
+        points:
+            start: 11
+            end: 41
+            inc: 2
+            interval: 2000
+
+meta:
+    # For linear regression fixed-length experiments.
+    vary_support_size: fixed
+    fixed_support_size: 25
+    multi_k_support: false
+
+    # More inner updates than the 1-2 step runs. Start at 5 for true MAML;
+    # try 10 after confirming memory/time and stability.
+    num_inner_steps: 5
+    inner_lr_mode: learned_per_param
+    first_order: false
+
+    # Reduce this to 32 if the 5-step second-order graph is still too large.
+    meta_batch_size: 64
+
+out_dir: ../models/meta_linear_regression_small_many_steps
+
+wandb:
+    name: "meta_linear_regression_small_many_steps"

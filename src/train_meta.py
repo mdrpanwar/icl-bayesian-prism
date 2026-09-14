@@ -13,6 +13,7 @@ import os
 import sys
 import uuid
 import random
+import time
 
 import numpy as np
 import torch
@@ -30,53 +31,76 @@ from models import build_model
 from samplers import get_data_sampler, sample_scale
 from tasks import get_task_sampler
 from curriculum import Curriculum
-from eval import eval_model, load_into_model_from_run, get_run_metrics
+from eval import (
+    eval_model,
+    get_run_metrics,
+    load_into_model_from_run,
+    preserve_rng_state,
+)
+from meta_utils import (
+    configure_inner_lrs,
+    get_inner_lrs,
+    inner_adapt,
+    inner_lr_stats,
+    trainable_model_params,
+    update_params_with_grads,
+)
+from checkpointing import (
+    PreemptionHandler,
+    atomic_torch_save,
+    load_training_state,
+    restore_rng_state,
+    save_training_state,
+)
+
+
 
 
 torch.backends.cudnn.benchmark = True
 
 
-# ---------------------------------------------------------------------------
-# Inner loop
-# ---------------------------------------------------------------------------
+def sanitize_run_name(run_name):
+    if run_name in (None, ""):
+        return None
+    cleaned = "".join(
+        ch if ch.isalnum() or ch in "-_." else "-"
+        for ch in str(run_name).strip()
+    )
+    cleaned = cleaned.strip("-_.")
+    return cleaned[:80] or None
 
 
-def inner_adapt(
-    model,
-    init_params,
-    xs_support,
-    ys_support,
-    inner_lr,
-    num_inner_steps,
-    first_order,
-    loss_func,
-):
-    """Run num_inner_steps SGD steps on the support loss, returning fast weights.
+def apply_run_name(args):
+    if getattr(args, "run_name", None) not in (None, ""):
+        args.wandb.name = args.run_name
 
-    init_params: dict of {name: tensor}, possibly the live nn.Module params
-        (when full MAML) or detached copies (when first-order).
-    """
-    fast_params = init_params
-    for _ in range(num_inner_steps):
-        preds = functional_call(model, fast_params, (xs_support, ys_support))
-        loss_s = loss_func(preds, ys_support)
-        grads = torch.autograd.grad(
-            loss_s,
-            list(fast_params.values()),
-            create_graph=not first_order,
-            allow_unused=True,
+
+def get_run_dir_name(args, run_id):
+    slug = sanitize_run_name(getattr(args, "run_name", None))
+    if slug is None:
+        return run_id
+    return f"{slug}-{run_id}"
+
+
+def seed_everything(seed):
+    random.seed(seed)
+    np.random.seed(seed % (2**32 - 1))
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def validate_meta_attention_backend(args):
+    """Reject unsupported attention/backend combinations without mutation."""
+    if args.meta.first_order and args.model.attn_implementation == "sdpa":
+        raise ValueError(
+            "The current vectorized FOMAML implementation uses functorch vmap, "
+            "which is incompatible with PyTorch's fused SDPA kernels in this "
+            "training path and can fail with `LSE is not correctly aligned "
+            "(strideH)`. Set model.attn_implementation: eager for this "
+            "implementation, or add an explicit non-vmap SDPA training path "
+            "before using sdpa."
         )
-        # unused = [n for (n, _), g in zip(fast_params.items(), grads) if g is None]
-        # print(f"[inner_adapt] params with grad=None: {unused}")
-        # breakpoint()
-        
-        # Some GPT2 params (wte, wpe under pos_encode=False) never enter the
-        # graph; their grad is None and they should be left untouched.
-        fast_params = {
-            name: p if g is None else p - inner_lr * g
-            for (name, p), g in zip(fast_params.items(), grads)
-        }
-    return fast_params
 
 
 # ---------------------------------------------------------------------------
@@ -84,23 +108,133 @@ def inner_adapt(
 # ---------------------------------------------------------------------------
 
 
+def get_fixed_support_size(meta_args):
+    """Return the configured fixed support size, with no sampling."""
+    k = meta_args.fixed_support_size
+    if k is None:
+        raise ValueError(
+            "meta.fixed_support_size must be set when "
+            "meta.vary_support_size is 'fixed'."
+        )
+    if k < 0:
+        raise ValueError(f"meta.fixed_support_size must be >= 0, got {k}.")
+    return k
+
+
 def sample_support_size(meta_args, curriculum_n_points, curriculum_end):
     mode = meta_args.vary_support_size
     if mode == "match_curriculum":
+        # Random k from the currently available curriculum prefix.
         return random.randint(0, curriculum_n_points - 1)
     if mode == "full_range":
+        # Random k from the final curriculum range, regardless of current step.
         return random.randint(0, curriculum_end - 1)
     if mode == "fixed":
-        k = meta_args.fixed_support_size
-        if k is None:
-            k = curriculum_end - 1
-        return k
+        # No sampling: always use exactly meta.fixed_support_size.
+        return get_fixed_support_size(meta_args)
     raise ValueError(f"Unknown vary_support_size: {mode}")
+
+
+def max_support_size_for_step(meta_args, curriculum_n_points, curriculum_end):
+    """Largest support set size that can be used at the current step."""
+    mode = meta_args.vary_support_size
+    if mode == "fixed":
+        return get_fixed_support_size(meta_args)
+    if mode == "full_range":
+        return max(curriculum_end - 1, 0)
+    if mode == "match_curriculum":
+        return max(curriculum_n_points - 1, 0)
+    raise ValueError(f"Unknown vary_support_size: {mode}")
+
+
+def sample_support_sizes(meta_args, curriculum_n_points, curriculum_end):
+    """Return the support sizes to evaluate for one task.
+
+    In the default mode this preserves the old behavior: one randomly sampled
+    support size per task. When multi-k support is enabled, each task contributes
+    a small set of independent adapt/eval branches: zero-shot, a random small k,
+    a random medium k, and the current maximum k. Fixed support size is always
+    a single branch, even if multi-k support is enabled in the inherited config.
+    """
+    if meta_args.vary_support_size == "fixed":
+        return [sample_support_size(meta_args, curriculum_n_points, curriculum_end)]
+
+    if not getattr(meta_args, "multi_k_support", False):
+        return [sample_support_size(meta_args, curriculum_n_points, curriculum_end)]
+
+    max_k = max(curriculum_n_points - 1, 0)
+    if max_k == 0:
+        return [0]
+
+    small_hi = max(max_k // 3, 1)
+    medium_lo = min(small_hi + 1, max_k)
+    medium_hi = max((2 * max_k) // 3, medium_lo)
+
+    small_k = random.randint(1, small_hi)
+    medium_k = random.randint(medium_lo, medium_hi)
+    return [0, small_k, medium_k, max_k]
 
 
 # ---------------------------------------------------------------------------
 # Outer training step
 # ---------------------------------------------------------------------------
+
+
+def apply_outer_update(model, optimizer, loss, meta_args):
+    """Backpropagate one outer loss with optional clipping and fail-fast checks."""
+    max_norm = getattr(meta_args, "outer_grad_clip_norm", None)
+    if max_norm is not None:
+        max_norm = float(max_norm)
+        if max_norm <= 0:
+            raise ValueError("meta.outer_grad_clip_norm must be positive")
+
+    fail_on_nonfinite = bool(getattr(meta_args, "fail_on_nonfinite", False))
+    if fail_on_nonfinite and not bool(torch.isfinite(loss.detach())):
+        optimizer.zero_grad(set_to_none=True)
+        raise FloatingPointError(
+            f"Non-finite meta loss detected before backward: {loss.detach().item()}"
+        )
+
+    loss.backward()
+    parameters = [
+        parameter
+        for parameter in model.parameters()
+        if parameter.grad is not None
+    ]
+    if max_norm is None:
+        if parameters:
+            grad_norm = torch.linalg.vector_norm(
+                torch.stack(
+                    [
+                        torch.linalg.vector_norm(parameter.grad.detach().float())
+                        for parameter in parameters
+                    ]
+                )
+            )
+        else:
+            grad_norm = loss.new_zeros(())
+    else:
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            parameters,
+            max_norm,
+            error_if_nonfinite=fail_on_nonfinite,
+        )
+
+    if fail_on_nonfinite and not bool(torch.isfinite(grad_norm.detach())):
+        optimizer.zero_grad(set_to_none=True)
+        raise FloatingPointError(
+            f"Non-finite outer gradient norm detected: {grad_norm.detach().item()}"
+        )
+
+    was_clipped = bool(
+        max_norm is not None and grad_norm.detach().item() > max_norm
+    )
+    optimizer.step()
+    return {
+        "outer_grad_norm": float(grad_norm.detach().item()),
+        "outer_grad_was_clipped": float(was_clipped),
+        "outer_grad_clip_norm": max_norm,
+    }
 
 
 def meta_train_step(
@@ -114,17 +248,21 @@ def meta_train_step(
     curriculum_end,
     loss_func,
     n_query,
+    return_diagnostics=False,
 ):
     """Vectorized outer step. Same per-task semantics as `meta_train_step_loop`:
-    each task b independently samples k_b in [0, curriculum_n_points-1],
-    adapts on its first k_b examples, and is evaluated on its own n_query
-    length-1 query prompts.
+    each task b independently samples one or more support sizes k_b in
+    [0, curriculum_n_points-1], adapts on its first k_b examples, and is
+    evaluated on its own n_query length-1 query prompts.
 
     The meta-batch is split into the k_b > 0 group (one vmap'd
     adapt-then-query call with right-padding to k_max + a per-task loss
     mask) and the k_b == 0 group (one bulk forward, no inner step). GPT-2's
     causal attention naturally ignores right-padded positions, so no
     attention mask is needed -- only a loss mask on the support side.
+
+    Support examples are treated as independent length-1 prompts during the
+    inner update. Query examples are also independent length-1 prompts.
 
     `loss_func` is currently unused: support and query both use plain MSE,
     matching the existing tasks (linear regression, etc.). When non-MSE
@@ -135,41 +273,64 @@ def meta_train_step(
     n_total = xs.shape[1]
     n_dims = xs.shape[2]
 
-    # Trainable params only. Frozen wpe.weight is excluded; functional_call
-    # falls back to the model's stored value (zero) for any name not in dict.
-    params = {n: p for n, p in model.named_parameters() if p.requires_grad}
+    # Trainable model params only. Frozen wpe.weight and learned inner-loop LR
+    # parameters are excluded; functional_call falls back to stored values for
+    # params absent from this dict.
+    params = trainable_model_params(model)
+    inner_lrs = get_inner_lrs(model, meta_args)
 
     # Each task's queries become n_query independent length-1 prompts.
     xs_q = xs[:, n_total - n_query : n_total, :].reshape(B, n_query, 1, n_dims)
     ys_q = ys[:, n_total - n_query : n_total].reshape(B, n_query, 1)
 
-    ks = [
-        sample_support_size(meta_args, curriculum_n_points, curriculum_end)
+    ks_by_task = [
+        sample_support_sizes(meta_args, curriculum_n_points, curriculum_end)
         for _ in range(B)
     ]
-    ks_t = torch.tensor(ks, device=xs.device)
+    flat_task_ids = []
+    flat_ks = []
+    flat_weights = []
+    for task_id, task_ks in enumerate(ks_by_task):
+        branch_weight = 1.0 / len(task_ks)
+        for k in task_ks:
+            flat_task_ids.append(task_id)
+            flat_ks.append(k)
+            flat_weights.append(branch_weight)
+
+    task_ids_t = torch.tensor(flat_task_ids, device=xs.device)
+    ks_t = torch.tensor(flat_ks, device=xs.device)
+    branch_weights_t = torch.tensor(flat_weights, device=xs.device, dtype=xs.dtype)
     has_support = (ks_t > 0).nonzero(as_tuple=True)[0]
     no_support = (ks_t == 0).nonzero(as_tuple=True)[0]
+    support_capacity = n_total - n_query
+    if flat_ks and max(flat_ks) > support_capacity:
+        raise ValueError(
+            "Support size exceeds the sampled support block. "
+            f"Got max k={max(flat_ks)} with support_capacity={support_capacity}. "
+            "Increase the sampled prompt length or lower meta.fixed_support_size."
+        )
 
     per_task_losses_log = torch.zeros(B, device=xs.device)
     total_loss = xs.new_zeros(())
 
     # ---- k_b > 0 tasks: vmap'd adapt-then-query ----
     if has_support.numel() > 0:
+        task_ids_pos = task_ids_t[has_support]
         ks_pos = ks_t[has_support]
         k_max = int(ks_pos.max().item())
 
-        xs_s = xs[has_support, :k_max, :]
-        ys_s = ys[has_support, :k_max]
+        xs_s = xs[task_ids_pos, :k_max, :]
+        ys_s = ys[task_ids_pos, :k_max]
         positions = torch.arange(k_max, device=xs.device).unsqueeze(0)
         mask = (positions < ks_pos.unsqueeze(1)).to(xs.dtype)
-        xs_q_p = xs_q[has_support]
-        ys_q_p = ys_q[has_support]
+        xs_q_p = xs_q[task_ids_pos]
+        ys_q_p = ys_q[task_ids_pos]
+        branch_weights_p = branch_weights_t[has_support]
 
         def support_loss(p, xs_s_b, ys_s_b, mask_b):
             preds = functional_call(
-                model, p, (xs_s_b.unsqueeze(0), ys_s_b.unsqueeze(0))
-            ).squeeze(0)
+                model, p, (xs_s_b.unsqueeze(1), ys_s_b.unsqueeze(1))
+            ).squeeze(1)
             sq = (preds - ys_s_b) ** 2
             return (sq * mask_b).sum() / mask_b.sum().clamp(min=1.0)
 
@@ -179,35 +340,47 @@ def meta_train_step(
                 g = func_grad(support_loss)(fp, xs_s_b, ys_s_b, mask_b)
                 if meta_args.first_order:
                     g = {n: gv.detach() for n, gv in g.items()}
-                fp = {n: pv - meta_args.inner_lr * g[n] for n, pv in fp.items()}
+                fp = update_params_with_grads(fp, g, inner_lrs)
             preds_q = functional_call(model, fp, (xs_q_b, ys_q_b))
             return ((preds_q - ys_q_b) ** 2).mean()
 
         per_task_pos = vmap(
             adapt_then_query, in_dims=(None, 0, 0, 0, 0, 0)
         )(params, xs_s, ys_s, mask, xs_q_p, ys_q_p)
-        total_loss = total_loss + per_task_pos.sum()
+        total_loss = total_loss + (per_task_pos * branch_weights_p).sum()
 
         with torch.no_grad():
-            per_task_losses_log[has_support] = per_task_pos.detach()
+            per_task_losses_log.index_add_(
+                0,
+                task_ids_pos,
+                (per_task_pos.detach() * branch_weights_p).to(per_task_losses_log.dtype),
+            )
 
     # ---- k_b == 0 tasks: no inner step, one batched forward ----
     if no_support.numel() > 0:
+        task_ids_zero = task_ids_t[no_support]
         Bz = no_support.numel()
-        flat_x = xs_q[no_support].reshape(Bz * n_query, 1, n_dims)
-        flat_y = ys_q[no_support].reshape(Bz * n_query, 1)
+        flat_x = xs_q[task_ids_zero].reshape(Bz * n_query, 1, n_dims)
+        flat_y = ys_q[task_ids_zero].reshape(Bz * n_query, 1)
         preds_q = functional_call(model, params, (flat_x, flat_y))
         per_task_zero = ((preds_q - flat_y) ** 2).reshape(Bz, n_query).mean(dim=1)
-        total_loss = total_loss + per_task_zero.sum()
+        branch_weights_z = branch_weights_t[no_support]
+        total_loss = total_loss + (per_task_zero * branch_weights_z).sum()
 
         with torch.no_grad():
-            per_task_losses_log[no_support] = per_task_zero.detach()
+            per_task_losses_log.index_add_(
+                0,
+                task_ids_zero,
+                (per_task_zero.detach() * branch_weights_z).to(per_task_losses_log.dtype),
+            )
 
     meta_loss = total_loss / B
-    meta_loss.backward()
-    optimizer.step()
+    update_stats = apply_outer_update(model, optimizer, meta_loss, meta_args)
 
-    return meta_loss.item(), ks, per_task_losses_log.tolist()
+    result = (meta_loss.item(), flat_ks, per_task_losses_log.tolist())
+    if return_diagnostics:
+        return (*result, update_stats)
+    return result
 
 
 def meta_train_step_loop(
@@ -236,69 +409,83 @@ def meta_train_step_loop(
     n_total = xs.shape[1]
     n_dims = xs.shape[2]
 
-    # Skip frozen params (wpe.weight when pos_encode=False); functional_call
-    # falls back to the model's stored values for any name absent from the dict.
-    base_params = {
-        name: p for name, p in model.named_parameters() if p.requires_grad
-    }
+    # Skip frozen params and learned inner-loop LR parameters.
+    base_params = trainable_model_params(model)
+    inner_lrs = get_inner_lrs(model, meta_args)
 
     total_query_loss = 0.0
     per_task_query_losses = []
     per_task_k = []
 
     for b in range(meta_batch_size):
-        k_b = sample_support_size(meta_args, curriculum_n_points, curriculum_end)
-        per_task_k.append(k_b)
-
-        # Support: positions [0, k_b) of task b's prompt
-        xs_s = xs[b : b + 1, :k_b, :]
-        ys_s = ys[b : b + 1, :k_b]
-
-        # Inner adaptation
-        if meta_args.first_order:
-            init_params = {name: p.detach().requires_grad_(True) for name, p in base_params.items()}
-        else:
-            init_params = base_params
-
-        if k_b == 0:
-            # No support to adapt on -- skip inner step entirely.
-            fast_params = init_params
-        else:
-            fast_params = inner_adapt(
-                model,
-                init_params,
-                xs_s,
-                ys_s,
-                meta_args.inner_lr,
-                meta_args.num_inner_steps,
-                meta_args.first_order,
-                loss_func,
+        task_ks = sample_support_sizes(meta_args, curriculum_n_points, curriculum_end)
+        per_task_k.extend(task_ks)
+        task_query_loss = 0.0
+        support_capacity = n_total - n_query
+        if max(task_ks) > support_capacity:
+            raise ValueError(
+                "Support size exceeds the sampled support block. "
+                f"Got max k={max(task_ks)} with support_capacity={support_capacity}. "
+                "Increase the sampled prompt length or lower meta.fixed_support_size."
             )
 
-        # Query: m fresh (x, y) pairs from the same task, batched on the batch
-        # dim as length-1 prompts so each is a pure k-shot measurement.
-        xs_q = xs[b, n_total - n_query : n_total, :].reshape(n_query, 1, n_dims)
-        ys_q = ys[b, n_total - n_query : n_total].reshape(n_query, 1)
+        for k_b in task_ks:
+            # Support: positions [0, k_b) of task b's prompt. During adaptation,
+            # these are evaluated as independent length-1 batch elements.
+            xs_s = xs[b : b + 1, :k_b, :]
+            ys_s = ys[b : b + 1, :k_b]
 
-        preds_q = functional_call(model, fast_params, (xs_q, ys_q))
-        loss_q = ((preds_q - ys_q) ** 2).mean() / meta_batch_size
+            # Inner adaptation
+            if meta_args.first_order:
+                init_params = {
+                    name: p.detach().requires_grad_(True)
+                    for name, p in base_params.items()
+                }
+            else:
+                init_params = base_params
 
-        if meta_args.first_order:
-            grads_q = torch.autograd.grad(
-                loss_q, list(fast_params.values()), allow_unused=True
-            )
-            for (name, p), g in zip(base_params.items(), grads_q):
-                if g is None:
-                    continue
-                if p.grad is None:
-                    p.grad = g.detach().clone()
-                else:
-                    p.grad = p.grad + g.detach()
-        else:
-            loss_q.backward()
+            if k_b == 0:
+                # No support to adapt on -- skip inner step entirely.
+                fast_params = init_params
+            else:
+                fast_params = inner_adapt(
+                    model,
+                    init_params,
+                    xs_s,
+                    ys_s,
+                    inner_lrs,
+                    meta_args.num_inner_steps,
+                    meta_args.first_order,
+                    loss_func,
+                )
 
-        total_query_loss += loss_q.detach().item() * meta_batch_size
-        per_task_query_losses.append(loss_q.detach().item() * meta_batch_size)
+            # Query: m fresh (x, y) pairs from the same task, batched on the
+            # batch dim as length-1 prompts so each is a pure k-shot measurement.
+            xs_q = xs[b, n_total - n_query : n_total, :].reshape(n_query, 1, n_dims)
+            ys_q = ys[b, n_total - n_query : n_total].reshape(n_query, 1)
+
+            loss_weight = 1.0 / len(task_ks)
+            preds_q = functional_call(model, fast_params, (xs_q, ys_q))
+            loss_q = ((preds_q - ys_q) ** 2).mean() * loss_weight / meta_batch_size
+
+            if meta_args.first_order:
+                grads_q = torch.autograd.grad(
+                    loss_q, list(fast_params.values()), allow_unused=True
+                )
+                for (name, p), g in zip(base_params.items(), grads_q):
+                    if g is None:
+                        continue
+                    if p.grad is None:
+                        p.grad = g.detach().clone()
+                    else:
+                        p.grad = p.grad + g.detach()
+            else:
+                loss_q.backward()
+
+            task_query_loss += loss_q.detach().item() * meta_batch_size
+
+        total_query_loss += task_query_loss
+        per_task_query_losses.append(task_query_loss)
 
     optimizer.step()
     mean_query_loss = total_query_loss / meta_batch_size
@@ -310,6 +497,8 @@ def meta_train_step_loop(
 # ---------------------------------------------------------------------------
 
 
+
+@preserve_rng_state
 def maml_pointwise_eval(
     model,
     data_sampler,
@@ -321,6 +510,8 @@ def maml_pointwise_eval(
     stride,
     num_tasks,
     eval_batch_size,
+    inner_lrs=None,
+    seed=0,
 ):
     """Pointwise MAML eval on fixed task/prompt samples.
 
@@ -340,9 +531,10 @@ def maml_pointwise_eval(
     device = next(model.parameters()).device
     base_params = {
         name: p.detach()
-        for name, p in model.named_parameters()
-        if p.requires_grad
+        for name, p in trainable_model_params(model).items()
     }
+    if inner_lrs is None:
+        inner_lrs = inner_lr
 
     losses_per_k = torch.full((n_points,), float("nan"))
 
@@ -357,8 +549,19 @@ def maml_pointwise_eval(
 
     for batch_idx in range(n_batches):
         batch_count = min(eval_batch_size, num_tasks - batch_idx * eval_batch_size)
-        task = task_sampler()
+        batch_seed = seed + batch_idx
+        random.seed(batch_seed)
+        np.random.seed(batch_seed % (2**32 - 1))
+        torch.manual_seed(batch_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(batch_seed)
+        # Match eval_model: reset the private Gaussian generator per batch,
+        # then sample x before the task. ICL and MAML consequently see the
+        # same fixed rows for the same seed and batch size.
+        if hasattr(data_sampler, "data_rand_gen"):
+            data_sampler.data_rand_gen.manual_seed(batch_seed)
         xs = data_sampler.sample_xs(n_points, eval_batch_size).to(device)
+        task = task_sampler()
         ys = task.evaluate(xs).to(device)
 
         for b in range(batch_count):
@@ -377,7 +580,7 @@ def maml_pointwise_eval(
                         init_params,
                         xs_s,
                         ys_s,
-                        inner_lr,
+                        inner_lrs,
                         num_inner_steps,
                         first_order=True,
                         loss_func=lambda pred, target: (
@@ -438,25 +641,24 @@ def get_outer_optimizer(model, args):
 
 
 def meta_train(model, args):
+    configure_inner_lrs(model, args.meta)
     optimizer, lr_scheduler = get_outer_optimizer(model, args)
     curriculum = Curriculum(args.training.curriculum)
 
-    starting_step = 0
     state_path = os.path.join(args.out_dir, "state.pt")
-    if os.path.exists(state_path):
-        state = torch.load(state_path)
-        model.load_state_dict(state["model_state_dict"])
-        optimizer.load_state_dict(state["optimizer_state_dict"])
-        starting_step = state["train_step"] + 1
-        for _ in range(state["train_step"] + 1):
-            curriculum.update()
+    starting_step, resume_state = load_training_state(
+        state_path, model, optimizer, lr_scheduler=lr_scheduler,
+        curriculum=curriculum,
+    )
 
     n_dims = model.n_dims
     meta_args = args.meta
     meta_bsize = meta_args.meta_batch_size
     n_query = meta_args.num_query_points
 
-    data_kwargs = args.training.data_kwargs or {}
+    data_kwargs = dict(args.training.data_kwargs or {})
+    if args.training.data == "gaussian":
+        data_kwargs.setdefault("data_seed", args.training.seed)
     data_sampler = get_data_sampler(args.training.data, n_dims=n_dims, **data_kwargs)
 
     task_sampler = get_task_sampler(
@@ -468,6 +670,14 @@ def meta_train(model, args):
         is_save_task_pool=args.is_save_task_pool,
         **args.training.task_kwargs,
     )
+    if resume_state is not None:
+        restored_rng = restore_rng_state(resume_state, data_sampler)
+        print(
+            f"[checkpoint] resuming at step {starting_step}; "
+            f"rng_restored={restored_rng}",
+            flush=True,
+        )
+
 
     pbar = tqdm(range(starting_step, args.training.train_steps))
 
@@ -475,8 +685,22 @@ def meta_train(model, args):
     profile_warmup, profile_active = 3, 3
     profile_total = profile_warmup + profile_active
     prof = None  # opened lazily after warmup steps below
+    preemption = PreemptionHandler().install()
+    compute_profile_active = int(args.training.compute_profile_steps)
+    compute_profile_warmup = int(args.training.compute_profile_warmup_steps)
+    if compute_profile_active < 0 or compute_profile_warmup < 0:
+        raise ValueError("compute profiling step counts must be non-negative")
+    compute_profile_start = starting_step + compute_profile_warmup
+    compute_profile_end = compute_profile_start + compute_profile_active
+    compute_profile_started_at = None
+    profile_device = torch.cuda.get_device_name() if torch.cuda.is_available() else "cpu"
+
 
     for i in pbar:
+        if compute_profile_active and i == compute_profile_start:
+            torch.cuda.synchronize()
+            compute_profile_started_at = time.perf_counter()
+
         if profile_meta and i == profile_warmup and prof is None:
             torch.cuda.synchronize()
             prof = torch.profiler.profile(
@@ -489,9 +713,15 @@ def meta_train(model, args):
             )
             prof.__enter__()
 
-        # Per-step total examples: support uses up to curriculum.n_points-1 of
-        # the first n_points positions; queries are appended after that.
-        n_total = curriculum.n_points + n_query
+        # Per-step total examples: support comes before a fresh query block.
+        # In fixed-k mode, allocate enough support examples from the first step
+        # instead of waiting for the curriculum's point count to catch up.
+        support_capacity = max_support_size_for_step(
+            meta_args,
+            curriculum.n_points,
+            curriculum.n_points_schedule.end,
+        )
+        n_total = max(curriculum.n_points, support_capacity) + n_query
 
         task_sampler_args = {}
         if "sparse_linear_regression" in args.training.task:
@@ -513,7 +743,12 @@ def meta_train(model, args):
             ys_cuda = ys.cuda()
 
         with torch.profiler.record_function("meta_train_step"):
-            loss, per_task_k, per_task_q_loss = meta_train_step(
+            (
+                loss,
+                per_task_k,
+                per_task_q_loss,
+                update_stats,
+            ) = meta_train_step(
                 model,
                 optimizer,
                 task,
@@ -524,6 +759,7 @@ def meta_train(model, args):
                 curriculum.n_points_schedule.end,
                 loss_func,
                 n_query,
+                return_diagnostics=True,
             )
 
         if profile_meta and prof is not None and i + 1 == profile_total:
@@ -540,6 +776,39 @@ def meta_train(model, args):
             sys.exit(0)
         if lr_scheduler is not None:
             lr_scheduler.step()
+        if compute_profile_active:
+            curriculum.update()
+            if preemption.requested:
+                if not args.test_run:
+                    save_training_state(
+                        state_path, model, optimizer, i,
+                        lr_scheduler=lr_scheduler, curriculum=curriculum,
+                        data_sampler=data_sampler,
+                    )
+                preemption.exit_after_checkpoint()
+            if i + 1 >= compute_profile_end:
+                if compute_profile_started_at is None:
+                    raise RuntimeError(
+                        "compute profile ended without starting its timer"
+                    )
+                torch.cuda.synchronize()
+                elapsed = time.perf_counter() - compute_profile_started_at
+                seconds_per_step = elapsed / compute_profile_active
+                profile_payload = {
+                    "compute_profile/seconds_per_step": seconds_per_step,
+                    "compute_profile/warmup_steps": compute_profile_warmup,
+                    "compute_profile/measured_steps": compute_profile_active,
+                    "compute_profile/device": profile_device,
+                }
+                if not args.test_run:
+                    wandb.log(profile_payload, step=i + 1)
+                print(
+                    f"[compute-profile] {seconds_per_step:.6f} seconds/step "
+                    f"on {profile_device}",
+                    flush=True,
+                )
+                preemption.restore()
+                return
 
         baseline_loss = (
             sum(max(curriculum.n_dims_truncated - ii, 0) for ii in range(curriculum.n_points))
@@ -553,14 +822,32 @@ def meta_train(model, args):
              or i + 1 == args.training.train_steps)
             and not args.test_run
         ):
-            wandb.log(
+            log_payload = {
+                "meta_train/query_loss": loss,
+                "meta_train/excess_loss": loss / baseline_loss if baseline_loss > 0 else float("nan"),
+                "meta_train/mean_k": float(np.mean(per_task_k)),
+                "n_points": curriculum.n_points,
+                "n_dims": curriculum.n_dims_truncated,
+                "tasks_seen": (i + 1) * meta_bsize,
+            }
+            log_payload.update(
                 {
-                    "meta_train/query_loss": loss,
-                    "meta_train/excess_loss": loss / baseline_loss if baseline_loss > 0 else float("nan"),
-                    "meta_train/mean_k": float(np.mean(per_task_k)),
-                    "n_points": curriculum.n_points,
-                    "n_dims": curriculum.n_dims_truncated,
-                },
+                    f"meta_train/{key}": value
+                    for key, value in update_stats.items()
+                    if value is not None
+                }
+            )
+
+            log_payload.update(
+                inner_lr_stats(
+                    model,
+                    meta_args,
+                    include_layer=(i + 1) % 1000 == 0 or i + 1 == args.training.train_steps,
+                    include_layer_module=(i + 1) % 5000 == 0 or i + 1 == args.training.train_steps,
+                )
+            )
+            wandb.log(
+                log_payload,
                 step=i + 1,
             )
 
@@ -577,7 +864,7 @@ def meta_train(model, args):
                     task_name=args.training.task,
                     data_name=args.training.data,
                     n_dims=n_dims,
-                    n_points=curriculum.n_points_schedule.end,
+                    n_points=(args.training.eval_n_points or curriculum.n_points_schedule.end),
                     prompting_strategy="standard",
                     batch_size=64,
                     data_sampler_kwargs=data_kwargs,
@@ -609,17 +896,25 @@ def meta_train(model, args):
                 num_tasks=args.training.num_tasks,
                 **args.training.task_kwargs,
             )
+            eval_data_kwargs = dict(data_kwargs)
+            if args.training.data == "gaussian":
+                eval_data_kwargs["data_seed"] = meta_args.meta_eval_seed
+            eval_data_sampler = get_data_sampler(
+                args.training.data, n_dims=n_dims, **eval_data_kwargs
+            )
             losses = maml_pointwise_eval(
                 model,
-                data_sampler=data_sampler,
+                data_sampler=eval_data_sampler,
                 task_sampler=eval_task_sampler,
                 n_dims=n_dims,
-                n_points=curriculum.n_points_schedule.end,
+                n_points=(args.training.eval_n_points or curriculum.n_points_schedule.end),
                 inner_lr=meta_args.inner_lr,
                 num_inner_steps=meta_args.num_inner_steps,
                 stride=meta_args.meta_eval_stride,
                 num_tasks=meta_args.meta_eval_num_tasks,
                 eval_batch_size=eval_batch_size,
+                inner_lrs=get_inner_lrs(model, meta_args),
+                seed=meta_args.meta_eval_seed,
             )
             wandb_log_pointwise("maml_eval", losses, baseline_loss, step=i + 1)
 
@@ -631,12 +926,12 @@ def meta_train(model, args):
             one_indexed_steps % args.training.save_every_steps == 0
             or one_indexed_steps == args.training.train_steps
         ) and not args.test_run:
-            training_state = {
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "train_step": i,
-            }
-            torch.save(training_state, state_path)
+            save_training_state(
+                state_path, model, optimizer, i,
+                lr_scheduler=lr_scheduler, curriculum=curriculum,
+                data_sampler=data_sampler,
+            )
+
 
         if (
             args.training.keep_every_steps > 0
@@ -647,13 +942,24 @@ def meta_train(model, args):
             and not args.test_run
             and one_indexed_steps > 0
         ):
-            torch.save(
+            atomic_torch_save(
                 model.state_dict(),
                 os.path.join(args.out_dir, f"model_{one_indexed_steps}.pt"),
             )
+        if preemption.requested:
+            if not args.test_run:
+                save_training_state(
+                    state_path, model, optimizer, i,
+                    lr_scheduler=lr_scheduler, curriculum=curriculum,
+                    data_sampler=data_sampler,
+                )
+            print(f"[checkpoint] saved step {one_indexed_steps}", flush=True)
+            preemption.exit_after_checkpoint()
+    preemption.restore()
 
 
 def main(args):
+    seed_everything(args.training.seed)
     if not args.meta.first_order and args.model.attn_implementation != "eager":
         raise ValueError(
             "Second-order MAML (meta.first_order: false) requires "
@@ -662,6 +968,7 @@ def main(args):
             f"Got first_order={args.meta.first_order}, "
             f"attn_implementation={args.model.attn_implementation!r}."
         )
+    validate_meta_attention_backend(args)
 
     if args.test_run:
         curriculum_args = args.training.curriculum
@@ -688,6 +995,7 @@ def main(args):
         wandb.init(**wandb_init_kwargs)
 
     model = build_model(args.model)
+    configure_inner_lrs(model, args.meta)
     if args.model.load_model_path is not None:
         load_into_model_from_run(model, args.model.load_model_path)
     model.cuda()
@@ -711,7 +1019,8 @@ if __name__ == "__main__":
             run_id = str(uuid.uuid4())
 
         args.training.resume_id = run_id
-        out_dir = os.path.join(args.out_dir, run_id)
+        apply_run_name(args)
+        out_dir = os.path.join(args.out_dir, get_run_dir_name(args, run_id))
         if not os.path.exists(out_dir):
             os.makedirs(out_dir)
         args.out_dir = out_dir

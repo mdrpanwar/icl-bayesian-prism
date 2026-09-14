@@ -4,34 +4,7 @@ from torch.func import functional_call, grad as func_grad, vmap
 
 from samplers import get_data_sampler
 from tasks import get_task_sampler
-
-
-def inner_adapt(
-    model,
-    init_params,
-    xs_support,
-    ys_support,
-    inner_lr,
-    num_inner_steps,
-    first_order,
-    loss_func,
-):
-    """Run inner-loop gradient updates and return adapted parameters."""
-    fast_params = init_params
-    for _ in range(num_inner_steps):
-        preds = functional_call(model, fast_params, (xs_support, ys_support))
-        loss_s = loss_func(preds, ys_support)
-        grads = torch.autograd.grad(
-            loss_s,
-            list(fast_params.values()),
-            create_graph=not first_order,
-            allow_unused=True,
-        )
-        fast_params = {
-            name: p if g is None else p - inner_lr * g
-            for (name, p), g in zip(fast_params.items(), grads)
-        }
-    return fast_params
+from meta_utils import inner_adapt, trainable_model_params, update_params_with_grads
 
 
 def aggregate_metrics_with_nans(metrics, bootstrap_trials=1000):
@@ -79,6 +52,7 @@ def collect_maml_metrics_loop(
     n_points,
     inner_lr,
     num_inner_steps,
+    inner_lrs=None,
     num_eval_examples=1280,
     batch_size=64,
     data_sampler_kwargs={},
@@ -101,9 +75,10 @@ def collect_maml_metrics_loop(
 
     base_params = {
         name: p.detach()
-        for name, p in model.named_parameters()
-        if p.requires_grad
+        for name, p in trainable_model_params(model).items()
     }
+    if inner_lrs is None:
+        inner_lrs = inner_lr
     data_sampler = get_data_sampler(data_name, n_dims, **data_sampler_kwargs)
     task_sampler = get_task_sampler(
         task_name, n_dims, batch_size, **task_sampler_kwargs
@@ -140,7 +115,7 @@ def collect_maml_metrics_loop(
                         init_params,
                         xs_s,
                         ys_s,
-                        inner_lr,
+                        inner_lrs,
                         num_inner_steps,
                         first_order=True,
                         loss_func=lambda pred, target: ((pred - target) ** 2).mean(),
@@ -168,6 +143,7 @@ def collect_maml_metrics(
     n_points,
     inner_lr,
     num_inner_steps,
+    inner_lrs=None,
     num_eval_examples=1280,
     batch_size=64,
     data_sampler_kwargs={},
@@ -177,8 +153,9 @@ def collect_maml_metrics(
     """Collect MAML losses, vectorizing over eval examples for each k.
 
     This preserves `maml_pointwise_eval` semantics: for every evaluated context
-    length k, adapt independently on each row's prefix and evaluate y_k. The
-    speedup comes from vmap batching the independent per-row adaptation work.
+    length k, adapt on each row's prefix as independent length-1 support
+    examples and evaluate y_k as a length-1 query. The speedup comes from vmap
+    batching the independent per-row adaptation work.
     """
     if stride < 1:
         raise ValueError(f"stride must be >= 1, got {stride}")
@@ -189,9 +166,17 @@ def collect_maml_metrics(
 
     base_params = {
         name: p.detach()
-        for name, p in model.named_parameters()
-        if p.requires_grad
+        for name, p in trainable_model_params(model).items()
     }
+    if inner_lrs is None:
+        inner_lrs = inner_lr
+    elif isinstance(inner_lrs, dict):
+        inner_lrs = {
+            name: value.detach() if torch.is_tensor(value) else value
+            for name, value in inner_lrs.items()
+        }
+    elif torch.is_tensor(inner_lrs):
+        inner_lrs = inner_lrs.detach()
     data_sampler = get_data_sampler(data_name, n_dims, **data_sampler_kwargs)
     task_sampler = get_task_sampler(
         task_name, n_dims, batch_size, **task_sampler_kwargs
@@ -206,18 +191,19 @@ def collect_maml_metrics(
         preds = functional_call(
             model,
             params,
-            (xs_support.unsqueeze(0), ys_support.unsqueeze(0)),
-        ).squeeze(0)
+            (xs_support.unsqueeze(1), ys_support.unsqueeze(1)),
+        ).squeeze(1)
         return ((preds - ys_support) ** 2).mean()
 
     def adapt_then_query(params, xs_support, ys_support, xs_query, ys_query):
         fast_params = params
         for _ in range(num_inner_steps):
             grads = func_grad(support_loss)(fast_params, xs_support, ys_support)
-            fast_params = {
-                name: p - inner_lr * grads[name]
-                for name, p in fast_params.items()
+            grads = {
+                name: value.detach()
+                for name, value in grads.items()
             }
+            fast_params = update_params_with_grads(fast_params, grads, inner_lrs)
         pred = functional_call(
             model,
             fast_params,
@@ -274,6 +260,7 @@ def eval_model_maml(
     n_points,
     inner_lr,
     num_inner_steps,
+    inner_lrs=None,
     num_eval_examples=1280,
     batch_size=64,
     data_sampler_kwargs={},
@@ -288,6 +275,7 @@ def eval_model_maml(
         n_points=n_points,
         inner_lr=inner_lr,
         num_inner_steps=num_inner_steps,
+        inner_lrs=inner_lrs,
         num_eval_examples=num_eval_examples,
         batch_size=batch_size,
         data_sampler_kwargs=data_sampler_kwargs,
