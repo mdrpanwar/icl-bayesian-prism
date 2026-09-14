@@ -1,0 +1,17 @@
+inherit:
+    - maml_lr20_support20_query20.yaml
+
+training:
+    learning_rate: 0.00001
+
+meta:
+    inner_lr: 0.002
+    inner_lr_mode: learned_per_param
+    inner_lr_parameterization: bounded_signed
+    inner_lr_bound: 0.05
+    outer_grad_clip_norm: 1.0
+    fail_on_nonfinite: true
+
+wandb:
+    name: maml_lr20_support20_query20_stable
+    notes: Stable Meta-SGD control with bounded signed inner rates and clipped outer gradients.

@@ -1,0 +1,8 @@
+inherit:
+    - icl_lr5_loss_budget.yaml
+
+model:
+    pos_encode: true
+
+wandb:
+    name: icl_lr5_last1_positional

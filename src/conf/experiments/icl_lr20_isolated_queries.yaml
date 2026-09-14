@@ -1,0 +1,12 @@
+inherit:
+    - icl_lr20_condition20_loss20.yaml
+
+model:
+    attn_implementation: eager
+    attention_mode: causal
+    prefix_condition_points: 20
+    isolate_query_points: true
+
+wandb:
+    name: icl_lr20_isolated_queries
+    notes: Each query sees the 20-point support prefix and itself, but no other queries.
