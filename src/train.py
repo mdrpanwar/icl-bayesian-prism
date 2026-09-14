@@ -28,19 +28,60 @@ import wandb
 import pdb
 import time
 from training_utils import compute_and_log_model_norm, filter_hold_out_freq, listify, equal_ignore_order
+from loss_positions import resolve_loss_range
+from checkpointing import (
+    PreemptionHandler,
+    atomic_torch_save,
+    load_training_state,
+    restore_rng_state,
+    save_training_state,
+)
+
+
 
 torch.backends.cudnn.benchmark = True
 
 
-def train_step(model, xs, ys, optimizer, loss_func, batch_idx, max_train_steps, k_steps_for_loss="all", num_accum_steps=1, lr_scheduler=None):
+def sanitize_run_name(run_name):
+    if run_name in (None, ""):
+        return None
+    cleaned = "".join(
+        ch if ch.isalnum() or ch in "-_." else "-"
+        for ch in str(run_name).strip()
+    )
+    cleaned = cleaned.strip("-_.")
+    return cleaned[:80] or None
+
+
+def apply_run_name(args):
+    if getattr(args, "run_name", None) not in (None, ""):
+        args.wandb.name = args.run_name
+
+
+def get_run_dir_name(args, run_id):
+    slug = sanitize_run_name(getattr(args, "run_name", None))
+    if slug is None:
+        return run_id
+    return f"{slug}-{run_id}"
+
+
+def seed_everything(seed):
+    random.seed(seed)
+    np.random.seed(seed % (2**32 - 1))
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def train_step(model, xs, ys, optimizer, loss_func, batch_idx, max_train_steps, k_steps_for_loss="all", loss_positions=None, num_accum_steps=1, lr_scheduler=None):
     # optimizer.zero_grad()
     output = model(xs, ys)
-    if k_steps_for_loss == "all":
-        loss = loss_func(output, ys)
-    else:
-        loss = loss_func(
-            output[:, -int(k_steps_for_loss) :], ys[:, -int(k_steps_for_loss) :]
-        )
+    loss_start, loss_stop = resolve_loss_range(
+        output.shape[1],
+        k_steps_for_loss=k_steps_for_loss,
+        loss_positions=loss_positions,
+    )
+    loss = loss_func(output[:, loss_start:loss_stop], ys[:, loss_start:loss_stop])
 
     # normalize loss to account for batch accumulation
     loss = loss / num_accum_steps
@@ -64,6 +105,8 @@ def sample_seeds(total_seeds, count):
     return seeds
 
 def wandb_log_task(task, metrics_task, baseline_loss, point_wise_tags, step, suffix="", loss_scaling_factor=1.0):
+    # Evaluation may intentionally extend beyond the training sequence length.
+    point_wise_tags = list(range(len(metrics_task["mean"])))
     wandb.log(
         {
             f"{task}_eval{suffix}/overall_loss": np.mean(metrics_task["mean"]) * loss_scaling_factor,
@@ -75,7 +118,9 @@ def wandb_log_task(task, metrics_task, baseline_loss, point_wise_tags, step, suf
         step=step,
     )
 
-def get_n_points_eval(task, n_dims, task_kwargs, curriculum):
+def get_n_points_eval(task, n_dims, task_kwargs, curriculum, eval_n_points=None):
+    if eval_n_points is not None:
+        return eval_n_points
     return curriculum.n_points_schedule.end
     # n_points_eval = 0
     # if 'polynomials_deg2_monomials_selection' in task:
@@ -148,15 +193,11 @@ def train(model, args):
     optimizer, lr_scheduler = get_training_optimizer(model, args)
     curriculum = Curriculum(args.training.curriculum)
 
-    starting_step = 0
     state_path = os.path.join(args.out_dir, "state.pt")
-    if os.path.exists(state_path):
-        state = torch.load(state_path)
-        model.load_state_dict(state["model_state_dict"])
-        optimizer.load_state_dict(state["optimizer_state_dict"])
-        starting_step = state["train_step"] + 1
-        for i in range(state["train_step"] + 1):
-            curriculum.update()
+    starting_step, resume_state = load_training_state(
+        state_path, model, optimizer, lr_scheduler=lr_scheduler,
+        curriculum=curriculum,
+    )
     n_dims = model.n_dims
     bsize = args.training.batch_size
     if args.training.data_transformation_args is not None:
@@ -180,6 +221,7 @@ def train(model, args):
         if data_kwargs is None:
             data_kwargs = {}
         data_kwargs.update({"scale": scale})
+        data_kwargs.setdefault("data_seed", args.training.seed)
 
     data_sampler = get_data_sampler(args.training.data, n_dims=n_dims, **data_kwargs)
 
@@ -262,6 +304,14 @@ def train(model, args):
         is_save_task_pool=args.is_save_task_pool,
         **args.training.task_kwargs,
     )
+    if resume_state is not None:
+        restored_rng = restore_rng_state(resume_state, data_sampler)
+        print(
+            f"[checkpoint] resuming at step {starting_step}; "
+            f"rng_restored={restored_rng}",
+            flush=True,
+        )
+
     pbar = tqdm(range(starting_step, args.training.train_steps))
     # log also when i+1 == args.training.train_steps
 
@@ -271,7 +321,24 @@ def train(model, args):
     log_loss = 0.
     log_point_wise_loss = 0.
     # outputs_list = []
+    preemption = PreemptionHandler().install()
+    profile_active = int(args.training.compute_profile_steps)
+    profile_warmup = int(args.training.compute_profile_warmup_steps)
+    if profile_active < 0 or profile_warmup < 0:
+        raise ValueError("compute profiling step counts must be non-negative")
+    if profile_active and num_accum_steps != 1:
+        raise ValueError("compute profiling currently requires num_accum_steps=1")
+    profile_start_step = starting_step + profile_warmup
+    profile_end_step = profile_start_step + profile_active
+    profile_started_at = None
+    profile_device = torch.cuda.get_device_name() if torch.cuda.is_available() else "cpu"
+
+
     for i in pbar:
+        if profile_active and i == profile_start_step:
+            torch.cuda.synchronize()
+            profile_started_at = time.perf_counter()
+
         if (i % num_accum_steps == 0):
             log_loss = 0.
             log_point_wise_loss = torch.zeros(size=(curriculum.n_points,), dtype=torch.float32).cuda()
@@ -344,9 +411,43 @@ def train(model, args):
             batch_idx=i,
             max_train_steps=args.training.train_steps,
             k_steps_for_loss=args.training.k_steps_for_loss,
+            loss_positions=args.training.loss_positions,
             num_accum_steps=num_accum_steps,
             lr_scheduler=lr_scheduler,
         )
+        if profile_active:
+            curriculum.update()
+            if preemption.requested:
+                if not args.test_run:
+                    save_training_state(
+                        state_path, model, optimizer, i,
+                        lr_scheduler=lr_scheduler, curriculum=curriculum,
+                        data_sampler=data_sampler,
+                    )
+                preemption.exit_after_checkpoint()
+            if i + 1 >= profile_end_step:
+                if profile_started_at is None:
+                    raise RuntimeError(
+                        "compute profile ended without starting its timer"
+                    )
+                torch.cuda.synchronize()
+                elapsed = time.perf_counter() - profile_started_at
+                seconds_per_step = elapsed / profile_active
+                profile_payload = {
+                    "compute_profile/seconds_per_step": seconds_per_step,
+                    "compute_profile/warmup_steps": profile_warmup,
+                    "compute_profile/measured_steps": profile_active,
+                    "compute_profile/device": profile_device,
+                }
+                if not args.test_run:
+                    wandb.log(profile_payload, step=i + 1)
+                print(
+                    f"[compute-profile] {seconds_per_step:.6f} seconds/step "
+                    f"on {profile_device}",
+                    flush=True,
+                )
+                preemption.restore()
+                return
 
         log_loss += loss
         point_wise_tags = list(range(curriculum.n_points))
@@ -380,6 +481,17 @@ def train(model, args):
                     "n_dims": curriculum.n_dims_truncated,
                     "max_freq": curriculum.max_freq,
                     "rff_dim": curriculum.rff_dim,
+                    "tasks_seen": (i + 1) * bsize,
+                    "objective/start": resolve_loss_range(
+                        curriculum.n_points,
+                        args.training.k_steps_for_loss,
+                        args.training.loss_positions,
+                    )[0],
+                    "objective/stop_exclusive": resolve_loss_range(
+                        curriculum.n_points,
+                        args.training.k_steps_for_loss,
+                        args.training.loss_positions,
+                    )[1],
                 },
                 step=(i+1)//num_accum_steps,
             )
@@ -404,7 +516,7 @@ def train(model, args):
                     task_name=task1,
                     data_name=args.training.data,
                     n_dims=args.model.n_dims,
-                    n_points=get_n_points_eval(task1, args.model.n_dims, task1_kwargs, curriculum),
+                    n_points=get_n_points_eval(task1, args.model.n_dims, task1_kwargs, curriculum, args.training.eval_n_points),
                     prompting_strategy="standard",
                     batch_size=64,
                     data_sampler_kwargs=data_kwargs,
@@ -416,7 +528,7 @@ def train(model, args):
                     task_name=task2,
                     data_name=args.training.data,
                     n_dims=args.model.n_dims,
-                    n_points=get_n_points_eval(task2, args.model.n_dims, task2_kwargs, curriculum),
+                    n_points=get_n_points_eval(task2, args.model.n_dims, task2_kwargs, curriculum, args.training.eval_n_points),
                     prompting_strategy="standard",
                     batch_size=64,
                     data_sampler_kwargs=data_kwargs,
@@ -442,7 +554,7 @@ def train(model, args):
                     task_name=task1,
                     data_name=args.training.data,
                     n_dims=args.model.n_dims,
-                    n_points=get_n_points_eval(task1, args.model.n_dims, task1_kwargs, curriculum),
+                    n_points=get_n_points_eval(task1, args.model.n_dims, task1_kwargs, curriculum, args.training.eval_n_points),
                     prompting_strategy="standard",
                     batch_size=64,
                     data_sampler_kwargs=data_kwargs,
@@ -454,7 +566,7 @@ def train(model, args):
                     task_name=task2,
                     data_name=args.training.data,
                     n_dims=args.model.n_dims,
-                    n_points=get_n_points_eval(task2, args.model.n_dims, task2_kwargs, curriculum),
+                    n_points=get_n_points_eval(task2, args.model.n_dims, task2_kwargs, curriculum, args.training.eval_n_points),
                     prompting_strategy="standard",
                     batch_size=64,
                     data_sampler_kwargs=data_kwargs,
@@ -466,7 +578,7 @@ def train(model, args):
                     task_name=task3,
                     data_name=args.training.data,
                     n_dims=args.model.n_dims,
-                    n_points=get_n_points_eval(task3, args.model.n_dims, task3_kwargs, curriculum),
+                    n_points=get_n_points_eval(task3, args.model.n_dims, task3_kwargs, curriculum, args.training.eval_n_points),
                     prompting_strategy="standard",
                     batch_size=64,
                     data_sampler_kwargs=data_kwargs,
@@ -491,7 +603,7 @@ def train(model, args):
                     task_name=args.training.task,
                     data_name=args.training.data,
                     n_dims=args.model.n_dims,
-                    n_points=get_n_points_eval(args.training.task, args.model.n_dims, args.training.task_kwargs, curriculum),
+                    n_points=get_n_points_eval(args.training.task, args.model.n_dims, args.training.task_kwargs, curriculum, args.training.eval_n_points),
                     prompting_strategy="standard",
                     batch_size=64,
                     data_sampler_kwargs=eval_data_kwargs,
@@ -515,7 +627,7 @@ def train(model, args):
                         task_name=args.training.task,
                         data_name=args.training.data,
                         n_dims=args.model.n_dims,
-                        n_points=get_n_points_eval(args.training.task, args.model.n_dims, args.training.task_kwargs, curriculum),
+                        n_points=get_n_points_eval(args.training.task, args.model.n_dims, args.training.task_kwargs, curriculum, args.training.eval_n_points),
                         prompting_strategy="standard",
                         batch_size=64,
                         data_sampler_kwargs=eval_data_kwargs,
@@ -533,12 +645,12 @@ def train(model, args):
         one_indexed_steps = i + 1
         pbar.set_description(f"loss {loss * loss_scaling_factor}")
         if (one_indexed_steps % args.training.save_every_steps == 0  or one_indexed_steps == args.training.train_steps) and not args.test_run:
-            training_state = {
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "train_step": i, # 0-indexed because this is used while resuming the training
-            }
-            torch.save(training_state, state_path)
+            save_training_state(
+                state_path, model, optimizer, i,
+                lr_scheduler=lr_scheduler, curriculum=curriculum,
+                data_sampler=data_sampler,
+            )
+
 
         if (
             args.training.keep_every_steps > 0
@@ -547,10 +659,38 @@ def train(model, args):
             and not args.test_run
             and one_indexed_steps > 0
         ):
-            torch.save(model.state_dict(), os.path.join(args.out_dir, f"model_{one_indexed_steps}.pt"))
+            atomic_torch_save(
+                model.state_dict(),
+                os.path.join(args.out_dir, f"model_{one_indexed_steps}.pt"),
+            )
+        if (
+            preemption.requested
+            and (
+                one_indexed_steps % num_accum_steps == 0
+                or one_indexed_steps == args.training.train_steps
+            )
+        ):
+            if not args.test_run:
+                save_training_state(
+                    state_path, model, optimizer, i,
+                    lr_scheduler=lr_scheduler, curriculum=curriculum,
+                    data_sampler=data_sampler,
+                )
+            print(f"[checkpoint] saved step {one_indexed_steps}", flush=True)
+            preemption.exit_after_checkpoint()
+    preemption.restore()
 
 
 def main(args):
+    seed_everything(args.training.seed)
+    if (
+        args.training.eval_n_points is not None
+        and args.training.eval_n_points > args.model.n_positions
+    ):
+        raise ValueError(
+            "training.eval_n_points cannot exceed model.n_positions "
+            f"({args.model.n_positions})"
+        )
     if args.test_run:
         curriculum_args = args.training.curriculum
         curriculum_args.points.start = curriculum_args.points.end
@@ -611,7 +751,8 @@ if __name__ == "__main__":
             run_id = str(uuid.uuid4())
 
         args.training.resume_id = run_id
-        out_dir = os.path.join(args.out_dir, run_id)
+        apply_run_name(args)
+        out_dir = os.path.join(args.out_dir, get_run_dir_name(args, run_id))
         if not os.path.exists(out_dir):
             os.makedirs(out_dir)
         args.out_dir = out_dir
