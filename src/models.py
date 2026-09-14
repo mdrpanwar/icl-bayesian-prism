@@ -26,6 +26,13 @@ def build_model(conf):
                 n_head=conf.n_head,
                 pos_encode=conf.pos_encode,
                 attn_implementation=conf.attn_implementation,
+                attention_mode=getattr(conf, "attention_mode", "causal"),
+                prefix_condition_points=getattr(
+                    conf, "prefix_condition_points", None
+                ),
+                isolate_query_points=getattr(
+                    conf, "isolate_query_points", False
+                ),
                 # resid_pdrop=conf.resid_pdrop,
                 # embd_pdrop=conf.embd_pdrop,
                 # attn_pdrop=conf.attn_pdrop,
@@ -112,6 +119,9 @@ class TransformerModel(nn.Module):
         self, n_dims, n_positions, n_embd=128, n_layer=12, n_head=4, pos_encode=True
         ,resid_pdrop=0.0, embd_pdrop=0.0, attn_pdrop=0.0, use_cache=False,
         attn_implementation="eager",
+        attention_mode="causal",
+        prefix_condition_points=None,
+        isolate_query_points=False,
     ):
         super(TransformerModel, self).__init__()
         configuration = GPT2Config(
@@ -132,10 +142,14 @@ class TransformerModel(nn.Module):
         self.n_positions = n_positions
         self.n_dims = n_dims
         self._pos_encode = pos_encode
+        self._attention_mode = attention_mode
+        self._prefix_condition_points = prefix_condition_points
+        self._isolate_query_points = isolate_query_points
         self._read_in = nn.Linear(n_dims, n_embd)
         self._backbone = GPT2Model(configuration)
         self._read_out = nn.Linear(n_embd, 1)
         self._apply_pos_encode_freeze()
+        self._apply_attention_mask()
 
     def _apply_pos_encode_freeze(self):
         # When pos_encode=False, we keep the wpe parameter (so the standard
@@ -147,6 +161,58 @@ class TransformerModel(nn.Module):
                 self._backbone.wpe.weight.zero_()
             self._backbone.wpe.weight.requires_grad_(False)
 
+    def _apply_attention_mask(self):
+        """Install the configured prefix/query visibility mask."""
+        if self._attention_mode not in {"causal", "prefix_bidirectional"}:
+            raise ValueError(f"Unknown attention mode: {self._attention_mode!r}")
+
+        max_tokens = 2 * self.n_positions
+        mask_device = self._backbone.h[0].attn.bias.device
+        mask = torch.tril(
+            torch.ones(
+                max_tokens, max_tokens, dtype=torch.bool, device=mask_device
+            )
+        )
+        prefix_points = self._prefix_condition_points
+        needs_custom_mask = (
+            self._attention_mode == "prefix_bidirectional"
+            or self._isolate_query_points
+        )
+        if needs_custom_mask:
+            if self._backbone.config._attn_implementation != "eager":
+                raise ValueError(
+                    "Custom prefix/query attention requires "
+                    "model.attn_implementation=eager"
+                )
+            if prefix_points is None or not 0 < prefix_points < self.n_positions:
+                raise ValueError(
+                    "prefix_condition_points must be between 1 and "
+                    f"n_positions-1, got {prefix_points!r}"
+                )
+
+        if self._attention_mode == "prefix_bidirectional":
+            prefix_tokens = 2 * prefix_points
+            mask[:prefix_tokens, :prefix_tokens] = True
+
+        if self._isolate_query_points:
+            prefix_tokens = 2 * prefix_points
+            mask[prefix_tokens:, :] = False
+            for point in range(prefix_points, self.n_positions):
+                x_token = 2 * point
+                y_token = x_token + 1
+                mask[x_token, :prefix_tokens] = True
+                mask[x_token, x_token] = True
+                mask[y_token, :prefix_tokens] = True
+                mask[y_token, x_token : y_token + 1] = True
+
+
+        mask = mask.view(1, 1, max_tokens, max_tokens)
+        for block in self._backbone.h:
+            # GPT2Attention already registers `bias` as a non-persistent
+            # buffer, so assignment keeps the mask device-aware and out of
+            # checkpoints.
+            block.attn.bias = mask.clone()
+
     def load_state_dict(self, state_dict, strict=True):
         # Older transformers (<4.21) saved an `attn.masked_bias` buffer per
         # layer that no longer exists; strip it so old checkpoints load cleanly.
@@ -155,6 +221,7 @@ class TransformerModel(nn.Module):
         }
         result = super().load_state_dict(state_dict, strict=strict)
         self._apply_pos_encode_freeze()
+        self._apply_attention_mask()
         return result
 
     @staticmethod
