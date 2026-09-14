@@ -2,3 +2,12 @@
 __pycache__
 claude-chats/
 models/
+
+# Local development environments and editor settings
+.venv
+.vscode/
+.pytest_cache/
+
+# Generated experiment outputs and temporary patch backups
+plots/
+*.orig
