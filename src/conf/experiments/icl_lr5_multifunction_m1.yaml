@@ -1,0 +1,5 @@
+inherit:
+    - icl_lr5_multifunction_base.yaml
+
+wandb:
+    name: icl_lr5_multifunction_m1

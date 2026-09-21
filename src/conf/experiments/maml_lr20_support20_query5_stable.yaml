@@ -1,0 +1,9 @@
+inherit:
+    - maml_lr20_support20_query1_stable.yaml
+
+meta:
+    num_query_points: 5
+
+wandb:
+    name: maml_lr20_support20_query5_steps5_stable
+    notes: Stable five-step Meta-SGD with support 20 and five fresh queries.

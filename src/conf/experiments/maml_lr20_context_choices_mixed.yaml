@@ -1,0 +1,8 @@
+inherit:
+    - maml_lr20_context_choices_base.yaml
+
+meta:
+    support_size_choices: "10,15,20"
+
+wandb:
+    name: maml_lr20_context_parallel_10_15_20_v2

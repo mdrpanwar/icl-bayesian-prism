@@ -1,0 +1,2 @@
+inherit:
+    - maml_lr5_multifunction_base.yaml

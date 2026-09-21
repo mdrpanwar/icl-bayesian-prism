@@ -1,0 +1,23 @@
+inherit:
+    - maml_lr20_support20_query20_stable.yaml
+
+model:
+    n_positions: 41
+
+training:
+    eval_n_points: 41
+    curriculum:
+        dims: {start: 20, end: 20, inc: 1, interval: 2000}
+        points: {start: 20, end: 20, inc: 1, interval: 2000}
+
+meta:
+    num_inner_steps: 5
+    num_query_points: 1
+    vary_support_size: choices_parallel
+    fixed_support_size: null
+    support_size_choices: "10,15,20"
+    meta_eval_stride: 5
+
+wandb:
+    name: maml_lr20_context_parallel_steps5_stable_v2
+    notes: Five-step Meta-SGD with parallel independent adaptations at every configured support size.

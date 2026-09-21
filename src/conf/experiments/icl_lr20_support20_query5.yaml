@@ -1,0 +1,11 @@
+inherit:
+    - icl_lr20_support20_query1.yaml
+
+training:
+    loss_positions: "range:20:25"
+    curriculum:
+        points: {start: 25, end: 25, inc: 1, interval: 2000}
+
+wandb:
+    name: icl_lr20_support20_query5
+    notes: Five interacting supervised queries after 20 conditioning examples.

@@ -1,0 +1,15 @@
+inherit:
+    - maml_lr5_multifunction_base.yaml
+
+training:
+    task_kwargs: {num_functions: 2, support_per_function: 5}
+    eval_n_points: 12
+    curriculum:
+        points: {start: 10, end: 10, inc: 1, interval: 2000}
+
+meta:
+    num_query_points: 2
+    fixed_support_size: 10
+
+wandb:
+    name: maml_lr5_multifunction_m2

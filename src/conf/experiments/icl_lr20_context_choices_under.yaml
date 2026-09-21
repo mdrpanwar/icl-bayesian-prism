@@ -1,0 +1,10 @@
+inherit:
+    - icl_lr20_context_choices_base.yaml
+
+training:
+    loss_position_set: "5,10,15"
+    curriculum:
+        points: {start: 16, end: 16, inc: 1, interval: 2000}
+
+wandb:
+    name: icl_lr20_context_joint_under_5_10_15_v2

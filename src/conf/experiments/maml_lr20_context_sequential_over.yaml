@@ -1,0 +1,13 @@
+inherit:
+    - maml_lr20_context_choices_base.yaml
+
+training:
+    curriculum:
+        points: {start: 35, end: 35, inc: 1, interval: 2000}
+
+meta:
+    vary_support_size: choices_sequential
+    support_size_choices: "25,30,35"
+
+wandb:
+    name: maml_lr20_context_sequential_over_25_30_35_v2

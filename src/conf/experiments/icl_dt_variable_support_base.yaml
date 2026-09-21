@@ -1,0 +1,18 @@
+inherit:
+    - icl_lr20_context_choices_base.yaml
+
+model:
+    n_positions: 101
+
+training:
+    task: decision_tree
+    task_kwargs: {depth: 4}
+    eval_n_points: 101
+    curriculum:
+        points: {start: 87, end: 87, inc: 1, interval: 2000}
+
+out_dir: ../models/decision_tree
+
+wandb:
+    name: icl_dt_variable_support
+    notes: Joint query losses at multiple support sizes for decision trees.

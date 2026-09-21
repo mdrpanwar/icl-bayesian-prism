@@ -1,0 +1,11 @@
+inherit:
+    - icl_dt_support65_query20.yaml
+
+model:
+    attn_implementation: eager
+    prefix_condition_points: 65
+    isolate_query_points: true
+
+wandb:
+    name: icl_dt_support65_query20_isolated
+    notes: Decision-tree ICL with 65 support and 20 mutually isolated queries.

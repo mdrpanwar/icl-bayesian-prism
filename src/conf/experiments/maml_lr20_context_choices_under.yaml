@@ -1,0 +1,12 @@
+inherit:
+    - maml_lr20_context_choices_base.yaml
+
+training:
+    curriculum:
+        points: {start: 15, end: 15, inc: 1, interval: 2000}
+
+meta:
+    support_size_choices: "5,10,15"
+
+wandb:
+    name: maml_lr20_context_parallel_under_5_10_15_v2

@@ -1,0 +1,31 @@
+inherit:
+    - maml_lr20_support20_query20_stable.yaml
+
+model:
+    n_dims: 20
+    n_positions: 101
+    pos_encode: false
+    attn_implementation: eager
+
+training:
+    task: decision_tree
+    task_kwargs: {depth: 4}
+    eval_n_points: 101
+    curriculum:
+        dims: {start: 20, end: 20, inc: 1, interval: 2000}
+        points: {start: 65, end: 65, inc: 5, interval: 2000}
+
+meta:
+    num_inner_steps: 5
+    num_query_points: 20
+    vary_support_size: fixed
+    fixed_support_size: 65
+    # Evaluate exactly at k=0, the trained support size k=65, and the final
+    # context k=100 (maml_pointwise_eval always includes its final point).
+    meta_eval_stride: 65
+
+out_dir: ../models/meta_decision_tree
+
+wandb:
+    name: maml_dt_support65_query20_steps5_stable
+    notes: Stable five-step Meta-SGD decision-tree pilot with fixed 65/20 split.

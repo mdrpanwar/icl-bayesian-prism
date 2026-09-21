@@ -1,0 +1,35 @@
+inherit:
+    - maml_lr20_support20_query20_stable.yaml
+
+model:
+    n_dims: 5
+    n_positions: 18
+    n_embd: 128
+    n_layer: 6
+    n_head: 4
+    pos_encode: false
+    attn_implementation: eager
+    num_task_slots: 3
+
+training:
+    task: multi_function_linear
+    task_kwargs: {num_functions: 1, support_per_function: 5}
+    eval_n_points: 6
+    curriculum:
+        dims: {start: 5, end: 5, inc: 1, interval: 2000}
+        points: {start: 5, end: 5, inc: 1, interval: 2000}
+
+meta:
+    num_inner_steps: 5
+    num_query_points: 1
+    vary_support_size: fixed
+    fixed_support_size: 5
+    run_icl_style_eval: false
+    run_maml_style_eval: true
+    meta_eval_stride: 5
+
+out_dir: ../models/meta_multi_function_linear
+
+wandb:
+    name: maml_lr5_multifunction_m1
+    notes: Five-step Meta-SGD over jointly adapted tagged 5D linear functions.

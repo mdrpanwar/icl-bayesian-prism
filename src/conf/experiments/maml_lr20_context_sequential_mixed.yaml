@@ -1,0 +1,9 @@
+inherit:
+    - maml_lr20_context_choices_base.yaml
+
+meta:
+    vary_support_size: choices_sequential
+    support_size_choices: "10,15,20"
+
+wandb:
+    name: maml_lr20_context_sequential_10_15_20_v2

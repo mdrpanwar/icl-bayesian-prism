@@ -1,0 +1,11 @@
+inherit:
+    - icl_lr20_support20_query5.yaml
+
+model:
+    attn_implementation: eager
+    prefix_condition_points: 20
+    isolate_query_points: true
+
+wandb:
+    name: icl_lr20_support20_query5_isolated
+    notes: Five supervised queries; each sees only the shared 20-example support.
