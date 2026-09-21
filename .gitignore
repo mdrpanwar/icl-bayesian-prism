@@ -10,4 +10,5 @@ models/
 
 # Generated experiment outputs and temporary patch backups
 plots/
+*.pdf
 *.orig
