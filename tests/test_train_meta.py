@@ -21,7 +21,9 @@ from meta_utils import (
 )
 import meta_eval
 import train_meta
+from train import train_step
 from train_meta import (
+    get_support_size_choices,
     apply_outer_update,
     max_support_size_for_step,
     meta_train_step,
@@ -110,6 +112,7 @@ def meta_args(**overrides):
         num_query_points=1,
         vary_support_size="match_curriculum",
         fixed_support_size=None,
+        support_size_choices=None,
         multi_k_support=False,
     )
     args.update(overrides)
@@ -117,6 +120,78 @@ def meta_args(**overrides):
 
 
 class TrainMetaTests(unittest.TestCase):
+    def test_discrete_support_choices(self):
+        args = meta_args(
+            vary_support_size="choices",
+            support_size_choices="5,10,15",
+        )
+        random.seed(7)
+        samples = [
+            sample_support_sizes(args, curriculum_n_points=3, curriculum_end=41)
+            for _ in range(100)
+        ]
+        observed = {sample[0] for sample in samples}
+        self.assertEqual(get_support_size_choices(args), [5, 10, 15])
+        self.assertEqual(observed, {5, 10, 15})
+        self.assertEqual(max_support_size_for_step(args, 3, 41), 15)
+
+    def test_joint_icl_position_set_averages_all_positions_per_sequence(self):
+        model = ToySequenceRegressor(weight=0.0)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
+        xs = torch.ones(1, 3, 1)
+        ys = torch.tensor([[1.0, 100.0, 3.0]])
+
+        loss, _ = train_step(
+            model, xs, ys, optimizer,
+            lambda pred, target: ((pred - target) ** 2).mean(),
+            batch_idx=0, max_train_steps=1, loss_position_set="0,2",
+        )
+
+        self.assertAlmostEqual(loss, 5.0)
+
+    def test_all_choices_parallel_returns_every_configured_support_size(self):
+        args = meta_args(
+            vary_support_size="choices_parallel",
+            support_size_choices="15,5,10",
+        )
+        self.assertEqual(
+            sample_support_sizes(args, curriculum_n_points=3, curriculum_end=41),
+            [5, 10, 15],
+        )
+        self.assertEqual(max_support_size_for_step(args, 3, 41), 15)
+
+    def test_all_choices_sequential_carries_fast_parameters_between_stages(self):
+        model = ToySequenceRegressor(weight=0.0)
+        args = meta_args(
+            vary_support_size="choices_sequential",
+            support_size_choices="1,3",
+            inner_lr=0.1,
+            num_inner_steps=1,
+            num_query_points=2,
+        )
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
+        xs = torch.tensor([[[1.0], [2.0], [3.0], [4.0], [5.0]]])
+        ys = torch.tensor([[2.0, 4.0, 6.0, 8.0, 10.0]])
+
+        loss, ks, per_task_losses = meta_train_step(
+            model, optimizer, None, xs, ys, args,
+            curriculum_n_points=3, curriculum_end=3,
+            loss_func=lambda pred, target: ((pred - target) ** 2).mean(),
+            n_query=2,
+        )
+
+        query_x = torch.tensor([4.0, 5.0])
+        query_y = torch.tensor([8.0, 10.0])
+        weight_after_1 = 0.4
+        weight_after_3 = 142.0 / 75.0
+        expected = torch.stack([
+            ((weight_after_1 * query_x - query_y) ** 2).mean(),
+            ((weight_after_3 * query_x - query_y) ** 2).mean(),
+        ]).mean()
+        self.assertEqual(ks, [1, 3])
+        self.assertTrue(torch.allclose(torch.tensor(loss), expected))
+        self.assertTrue(torch.allclose(torch.tensor(per_task_losses[0]), expected))
+
     def test_sdpa_first_order_validation_is_explicit_and_non_mutating(self):
         args = Munch(
             meta=Munch(first_order=True),
@@ -310,6 +385,34 @@ class TrainMetaTests(unittest.TestCase):
             apply_outer_update(model, optimizer, loss, args)
 
         self.assertTrue(torch.equal(model.weight.detach(), before))
+
+    def test_outer_guard_skips_catastrophic_preclip_norm(self):
+        model = ToySequenceRegressor(weight=10.0)
+        optimizer = torch.optim.SGD(model.parameters(), lr=1.0)
+        args = meta_args(
+            outer_grad_clip_norm=1.0,
+            max_outer_grad_norm_before_skip=100.0,
+            fail_on_nonfinite=True,
+        )
+        before = model.weight.detach().clone()
+        loss = (100.0 * model.weight).square().sum()
+        stats = apply_outer_update(model, optimizer, loss, args)
+        self.assertEqual(stats["outer_update_skipped"], 1.0)
+        self.assertGreater(stats["outer_grad_norm"], 100.0)
+        self.assertTrue(torch.equal(model.weight.detach(), before))
+
+    def test_outer_guard_skips_nonfinite_loss(self):
+        model = ToySequenceRegressor(weight=1.0)
+        optimizer = torch.optim.SGD(model.parameters(), lr=1.0)
+        args = meta_args(
+            outer_grad_clip_norm=1.0,
+            max_outer_grad_norm_before_skip=100.0,
+            fail_on_nonfinite=True,
+        )
+        loss = model.weight.sum() * torch.tensor(float("nan"))
+        stats = apply_outer_update(model, optimizer, loss, args)
+        self.assertEqual(stats["outer_update_skipped"], 1.0)
+        self.assertEqual(len(optimizer.state), 0)
 
     def test_inner_lr_stats_include_global_layer_and_layer_module_keys(self):
         model = ToyLayeredRegressor()

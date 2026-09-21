@@ -119,7 +119,11 @@ def eval_batch(model, task_sampler, xs, eval_ood, xs_p=None, data_sampler=None, 
             ys = task.evaluate_ood(xs) if eval_ood else task.evaluate(xs, mode="eval")
         else:
             ys = task.evaluate_ood(xs) if eval_ood else task.evaluate(xs)
-        pred = model(xs.to(device), ys.to(device)).detach()
+        task_ids = getattr(task, "task_ids", None)
+        model_kwargs = (
+            {"task_ids": task_ids.to(device)} if task_ids is not None else {}
+        )
+        pred = model(xs.to(device), ys.to(device), **model_kwargs).detach()
         metrics = task.get_metric()(pred.cpu(), ys)
     else:
         b_size, n_points, _ = xs.shape
@@ -366,6 +370,8 @@ def build_evals(conf):
         "batch_size": batch_size,
         "data_name": data_name,
         "prompting_strategy": "standard",
+        "data_sampler_kwargs": dict(getattr(conf.training, "data_kwargs", None) or {}),
+        "task_sampler_kwargs": dict(getattr(conf.training, "task_kwargs", None) or {}),
     }
 
     evaluation_kwargs = {}
@@ -464,9 +470,13 @@ def compute_eval_metrics(model, kwargs):
             kwargs.pop("inner_lr_parameterization", None)
             kwargs.pop("inner_lr_bound", None)
             return eval_model_maml(model, **kwargs)
-        kwargs.pop("inner_lr")
-        kwargs.pop("num_inner_steps")
-        kwargs.pop("stride")
+        # Baselines share the MAML task batch but have no inner adaptation.
+        # Do not forward Meta-SGD configuration to standard eval_model.
+        for key in (
+            "inner_lr", "inner_lr_mode", "inner_lr_parameterization",
+            "inner_lr_bound", "num_inner_steps", "stride",
+        ):
+            kwargs.pop(key, None)
         return eval_model(model, **kwargs)
 
     raise ValueError(f"Unknown eval_mode: {eval_mode}")

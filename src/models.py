@@ -33,6 +33,8 @@ def build_model(conf):
                 isolate_query_points=getattr(
                     conf, "isolate_query_points", False
                 ),
+                num_task_slots=getattr(conf, "num_task_slots", 0),
+                task_tag_mode=getattr(conf, "task_tag_mode", "additive"),
                 # resid_pdrop=conf.resid_pdrop,
                 # embd_pdrop=conf.embd_pdrop,
                 # attn_pdrop=conf.attn_pdrop,
@@ -110,7 +112,13 @@ def get_relevant_baselines(task_name):
         ],
     }
 
-    models = [model_cls(**kwargs) for model_cls, kwargs in task_to_baselines[task_name]]
+    # Composite episode generators need not have a meaningful classical
+    # baseline. Returning none keeps final model evaluation from turning a
+    # successfully completed training job into a failed job.
+    models = [
+        model_cls(**kwargs)
+        for model_cls, kwargs in task_to_baselines.get(task_name, [])
+    ]
     return models
 
 
@@ -122,10 +130,15 @@ class TransformerModel(nn.Module):
         attention_mode="causal",
         prefix_condition_points=None,
         isolate_query_points=False,
+        num_task_slots=0,
+        task_tag_mode="additive",
     ):
         super(TransformerModel, self).__init__()
+        if task_tag_mode not in {"additive", "prefix_token", "none"}:
+            raise ValueError(f"Unknown task_tag_mode: {task_tag_mode}")
+        tokens_per_point = 3 if task_tag_mode == "prefix_token" else 2
         configuration = GPT2Config(
-            n_positions=2 * n_positions,
+            n_positions=tokens_per_point * n_positions,
             n_embd=n_embd,
             n_layer=n_layer,
             n_head=n_head,
@@ -145,7 +158,19 @@ class TransformerModel(nn.Module):
         self._attention_mode = attention_mode
         self._prefix_condition_points = prefix_condition_points
         self._isolate_query_points = isolate_query_points
+        self._task_tag_mode = task_tag_mode
+        self._tokens_per_point = tokens_per_point
+        self._num_task_slots = int(num_task_slots)
+        if self._num_task_slots < 0:
+            raise ValueError("num_task_slots must be non-negative")
+        if task_tag_mode == "prefix_token" and self._num_task_slots == 0:
+            raise ValueError("prefix_token requires num_task_slots > 0")
         self._read_in = nn.Linear(n_dims, n_embd)
+        self._task_slot_embeddings = (
+            nn.Embedding(self._num_task_slots, n_embd)
+            if self._num_task_slots
+            else None
+        )
         self._backbone = GPT2Model(configuration)
         self._read_out = nn.Linear(n_embd, 1)
         self._apply_pos_encode_freeze()
@@ -166,7 +191,7 @@ class TransformerModel(nn.Module):
         if self._attention_mode not in {"causal", "prefix_bidirectional"}:
             raise ValueError(f"Unknown attention mode: {self._attention_mode!r}")
 
-        max_tokens = 2 * self.n_positions
+        max_tokens = self._tokens_per_point * self.n_positions
         mask_device = self._backbone.h[0].attn.bias.device
         mask = torch.tril(
             torch.ones(
@@ -191,19 +216,17 @@ class TransformerModel(nn.Module):
                 )
 
         if self._attention_mode == "prefix_bidirectional":
-            prefix_tokens = 2 * prefix_points
+            prefix_tokens = self._tokens_per_point * prefix_points
             mask[:prefix_tokens, :prefix_tokens] = True
 
         if self._isolate_query_points:
-            prefix_tokens = 2 * prefix_points
+            prefix_tokens = self._tokens_per_point * prefix_points
             mask[prefix_tokens:, :] = False
             for point in range(prefix_points, self.n_positions):
-                x_token = 2 * point
-                y_token = x_token + 1
-                mask[x_token, :prefix_tokens] = True
-                mask[x_token, x_token] = True
-                mask[y_token, :prefix_tokens] = True
-                mask[y_token, x_token : y_token + 1] = True
+                first_token = self._tokens_per_point * point
+                for token in range(first_token, first_token + self._tokens_per_point):
+                    mask[token, :prefix_tokens] = True
+                    mask[token, first_token : token + 1] = True
 
 
         mask = mask.view(1, 1, max_tokens, max_tokens)
@@ -239,7 +262,14 @@ class TransformerModel(nn.Module):
         zs = zs.view(bsize, 2 * points, dim)
         return zs
 
-    def forward(self, xs, ys, inds=None, output_hidden_states=False):
+    def forward(
+        self,
+        xs,
+        ys,
+        inds=None,
+        output_hidden_states=False,
+        task_ids=None,
+    ):
         if inds is None:
             inds = torch.arange(ys.shape[1])
         else:
@@ -248,6 +278,27 @@ class TransformerModel(nn.Module):
                 raise ValueError("inds contain indices where xs and ys are not defined")
         zs = self._combine(xs, ys) # interleaved x and y in n_points dim i.e. x1, y1, x2, y2, ...
         embeds = self._read_in(zs)
+        if self._task_tag_mode != "none" and self._task_slot_embeddings is not None:
+            if task_ids is None:
+                raise ValueError(
+                    "task_ids are required when model.num_task_slots is positive"
+                )
+            if task_ids.shape != ys.shape:
+                raise ValueError(
+                    f"task_ids shape {tuple(task_ids.shape)} must match "
+                    f"ys shape {tuple(ys.shape)}"
+                )
+            slot_embeds = self._task_slot_embeddings(task_ids.long())
+            if self._task_tag_mode == "prefix_token":
+                embeds = torch.stack(
+                    (slot_embeds, embeds[:, 0::2], embeds[:, 1::2]), dim=2
+                ).reshape(ys.shape[0], 3 * ys.shape[1], -1)
+            else:
+                embeds = embeds + slot_embeds.repeat_interleave(2, dim=1)
+        elif task_ids is not None and self._task_tag_mode != "none":
+            raise ValueError(
+                "task_ids were provided but model.num_task_slots is zero"
+            )
         backbone_output = self._backbone(inputs_embeds=embeds, output_hidden_states=output_hidden_states, return_dict=True)
         # if output_hidden_states=True, backbone_output.hidden_states = list of len n_layers with each element of shape (batch_size, n_points * 2, embed_dim). Each element corresponds to the output from the application of i-th layer (0th element being the input and 12th element being the output of last layer)
 
@@ -262,10 +313,11 @@ class TransformerModel(nn.Module):
         # pdb.set_trace()
         output = backbone_output.last_hidden_state
         prediction = self._read_out(output)
+        prediction = prediction[:, 1::3, 0] if self._task_tag_mode == "prefix_token" else prediction[:, ::2, 0]
         if not output_hidden_states:
-            return prediction[:, ::2, 0][:, inds]  # predict only on xs
+            return prediction[:, inds]  # predict only on xs
         else:
-            return prediction[:, ::2, 0][:, inds], backbone_output.hidden_states
+            return prediction[:, inds], backbone_output.hidden_states
 
 
 class TaskPrefixTransformerModel(TransformerModel):

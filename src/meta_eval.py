@@ -1,3 +1,5 @@
+import time
+
 import numpy as np
 import torch
 from torch.func import functional_call, grad as func_grad, vmap
@@ -97,6 +99,9 @@ def collect_maml_metrics_loop(
         task = task_sampler()
         xs = data_sampler.sample_xs(n_points, batch_size).to(device)
         ys = task.evaluate(xs).to(device)
+        episode_task_ids = getattr(task, "task_ids", None)
+        if episode_task_ids is not None:
+            episode_task_ids = episode_task_ids.to(device)
 
         for b in range(batch_count):
             row_idx = example_offset + b
@@ -119,12 +124,23 @@ def collect_maml_metrics_loop(
                         num_inner_steps,
                         first_order=True,
                         loss_func=lambda pred, target: ((pred - target) ** 2).mean(),
+                        task_ids_support=(
+                            episode_task_ids[b : b + 1, :k]
+                            if episode_task_ids is not None else None
+                        ),
                     )
 
                 xs_q = xs[b : b + 1, k : k + 1, :]
                 ys_q = ys[b : b + 1, k : k + 1]
+                query_kwargs = None
+                if episode_task_ids is not None:
+                    query_kwargs = {
+                        "task_ids": episode_task_ids[b : b + 1, k : k + 1]
+                    }
                 with torch.no_grad():
-                    pred = functional_call(model, fast_params, (xs_q, ys_q))
+                    pred = functional_call(
+                        model, fast_params, (xs_q, ys_q), query_kwargs
+                    )
                 metrics[row_idx, k] = ((pred - ys_q) ** 2).mean()
 
         example_offset += batch_count
@@ -149,6 +165,8 @@ def collect_maml_metrics(
     data_sampler_kwargs={},
     task_sampler_kwargs={},
     stride=1,
+    progress_desc=None,
+    progress_every_contexts=5,
 ):
     """Collect MAML losses, vectorizing over eval examples for each k.
 
@@ -187,64 +205,121 @@ def collect_maml_metrics(
     if (n_points - 1) not in ks:
         ks.append(n_points - 1)
 
-    def support_loss(params, xs_support, ys_support):
+    def support_loss(params, xs_support, ys_support, ids_support=None):
+        kwargs = (
+            {"task_ids": ids_support.unsqueeze(1)}
+            if ids_support is not None else None
+        )
         preds = functional_call(
             model,
             params,
             (xs_support.unsqueeze(1), ys_support.unsqueeze(1)),
+            kwargs,
         ).squeeze(1)
         return ((preds - ys_support) ** 2).mean()
 
-    def adapt_then_query(params, xs_support, ys_support, xs_query, ys_query):
+    def adapt_then_query(
+        params, xs_support, ys_support, xs_query, ys_query,
+        ids_support=None, ids_query=None,
+    ):
         fast_params = params
         for _ in range(num_inner_steps):
-            grads = func_grad(support_loss)(fast_params, xs_support, ys_support)
+            grads = func_grad(support_loss)(
+                fast_params, xs_support, ys_support, ids_support
+            )
             grads = {
                 name: value.detach()
                 for name, value in grads.items()
             }
             fast_params = update_params_with_grads(fast_params, grads, inner_lrs)
+        kwargs = {"task_ids": ids_query.unsqueeze(0)} if ids_query is not None else None
         pred = functional_call(
             model,
             fast_params,
             (xs_query.unsqueeze(0), ys_query.unsqueeze(0)),
+            kwargs,
         ).squeeze(0)
         return ((pred - ys_query) ** 2).mean()
 
     n_batches = (num_eval_examples + batch_size - 1) // batch_size
     example_offset = 0
+    started = time.monotonic()
+    if progress_desc is not None:
+        print(
+            f"[maml-eval] {progress_desc}: {num_eval_examples} tasks, "
+            f"{len(ks)} context lengths, {num_inner_steps} inner steps, "
+            f"{n_batches} batches",
+            flush=True,
+        )
 
     for batch_idx in range(n_batches):
+        batch_started = time.monotonic()
         batch_count = min(batch_size, num_eval_examples - batch_idx * batch_size)
         task = task_sampler()
         xs_full = data_sampler.sample_xs(n_points, batch_size).to(device)
         ys_full = task.evaluate(xs_full).to(device)
+        task_ids_full = getattr(task, "task_ids", None)
+        if task_ids_full is not None:
+            task_ids_full = task_ids_full.to(device)
         xs = xs_full[:batch_count]
         ys = ys_full[:batch_count]
+        task_ids = (
+            task_ids_full[:batch_count] if task_ids_full is not None else None
+        )
 
-        for k in ks:
+        for k_idx, k in enumerate(ks):
             xs_query = xs[:, k : k + 1, :]
             ys_query = ys[:, k : k + 1]
             if k == 0:
-                preds = functional_call(model, base_params, (xs_query, ys_query))
+                kwargs = (
+                    {"task_ids": task_ids[:, k : k + 1]}
+                    if task_ids is not None else None
+                )
+                preds = functional_call(
+                    model, base_params, (xs_query, ys_query), kwargs
+                )
                 losses = ((preds - ys_query) ** 2).mean(dim=1)
+            elif task_ids is None:
+                losses = vmap(
+                    adapt_then_query, in_dims=(None, 0, 0, 0, 0),
+                )(base_params, xs[:, :k, :], ys[:, :k], xs_query, ys_query)
             else:
                 losses = vmap(
                     adapt_then_query,
-                    in_dims=(None, 0, 0, 0, 0),
+                    in_dims=(None, 0, 0, 0, 0, 0, 0),
                 )(
-                    base_params,
-                    xs[:, :k, :],
-                    ys[:, :k],
-                    xs_query,
-                    ys_query,
+                    base_params, xs[:, :k, :], ys[:, :k], xs_query, ys_query,
+                    task_ids[:, :k], task_ids[:, k : k + 1],
                 )
             metrics[
                 example_offset : example_offset + batch_count,
                 k,
             ] = losses.detach().cpu()
 
+            if progress_desc is not None and (
+                (k_idx + 1) % progress_every_contexts == 0
+                or k_idx + 1 == len(ks)
+            ):
+                print(
+                    f"[maml-eval] {progress_desc}: batch {batch_idx + 1}/"
+                    f"{n_batches}, context {k_idx + 1}/{len(ks)} (k={k})",
+                    flush=True,
+                )
+
         example_offset += batch_count
+        if progress_desc is not None:
+            elapsed = time.monotonic() - started
+            completed = batch_idx + 1
+            eta = elapsed / completed * (n_batches - completed)
+            rate = example_offset / elapsed if elapsed > 0 else float("nan")
+            print(
+                f"[maml-eval] {progress_desc}: completed batch {completed}/"
+                f"{n_batches} ({example_offset}/{num_eval_examples} tasks); "
+                f"batch={time.monotonic() - batch_started:.1f}s, "
+                f"elapsed={elapsed / 60:.1f}m, ETA={eta / 60:.1f}m, "
+                f"rate={rate:.2f} tasks/s",
+                flush=True,
+            )
 
     if was_training:
         model.train()
@@ -266,6 +341,8 @@ def eval_model_maml(
     data_sampler_kwargs={},
     task_sampler_kwargs={},
     stride=1,
+    progress_desc=None,
+    progress_every_contexts=5,
 ):
     metrics = collect_maml_metrics(
         model=model,
@@ -281,5 +358,7 @@ def eval_model_maml(
         data_sampler_kwargs=data_sampler_kwargs,
         task_sampler_kwargs=task_sampler_kwargs,
         stride=stride,
+        progress_desc=progress_desc,
+        progress_every_contexts=progress_every_contexts,
     )
     return aggregate_metrics_with_nans(metrics)

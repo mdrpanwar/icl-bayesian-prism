@@ -73,15 +73,54 @@ def seed_everything(seed):
         torch.cuda.manual_seed_all(seed)
 
 
-def train_step(model, xs, ys, optimizer, loss_func, batch_idx, max_train_steps, k_steps_for_loss="all", loss_positions=None, num_accum_steps=1, lr_scheduler=None):
+def parse_position_choices(spec, num_positions, field_name="loss_position_choices"):
+    if spec in (None, ""):
+        return None
+    try:
+        choices = [int(value.strip()) for value in str(spec).split(",")]
+    except ValueError as exc:
+        raise ValueError(
+            f"training.{field_name} must be comma-separated integers"
+        ) from exc
+    if not choices or any(position < 0 or position >= num_positions for position in choices):
+        raise ValueError(
+            f"loss position choices {choices} are invalid for {num_positions} positions"
+        )
+    if len(set(choices)) != len(choices):
+        raise ValueError(f"training.{field_name} must not contain duplicates")
+    return choices
+
+
+def train_step(model, xs, ys, optimizer, loss_func, batch_idx, max_train_steps, k_steps_for_loss="all", loss_positions=None, loss_position_choices=None, loss_position_set=None, task_ids=None, num_accum_steps=1, lr_scheduler=None):
     # optimizer.zero_grad()
-    output = model(xs, ys)
-    loss_start, loss_stop = resolve_loss_range(
-        output.shape[1],
-        k_steps_for_loss=k_steps_for_loss,
-        loss_positions=loss_positions,
+    model_kwargs = {"task_ids": task_ids} if task_ids is not None else {}
+    output = model(xs, ys, **model_kwargs)
+    choices = parse_position_choices(loss_position_choices, output.shape[1])
+    position_set = parse_position_choices(
+        loss_position_set, output.shape[1], field_name="loss_position_set"
     )
-    loss = loss_func(output[:, loss_start:loss_stop], ys[:, loss_start:loss_stop])
+    if choices is not None and position_set is not None:
+        raise ValueError(
+            "loss_position_choices and loss_position_set are mutually exclusive"
+        )
+    if choices is None and position_set is None:
+        loss_start, loss_stop = resolve_loss_range(
+            output.shape[1],
+            k_steps_for_loss=k_steps_for_loss,
+            loss_positions=loss_positions,
+        )
+        loss = loss_func(output[:, loss_start:loss_stop], ys[:, loss_start:loss_stop])
+    elif choices is not None:
+        selected = torch.tensor(
+            random.choices(choices, k=output.shape[0]), device=output.device
+        )
+        rows = torch.arange(output.shape[0], device=output.device)
+        loss = loss_func(output[rows, selected], ys[rows, selected])
+    else:
+        # Every row contributes every requested position to the same optimizer
+        # update. This is the joint sparse-supervision condition.
+        selected = torch.tensor(position_set, device=output.device)
+        loss = loss_func(output[:, selected], ys[:, selected])
 
     # normalize loss to account for batch accumulation
     loss = loss / num_accum_steps
@@ -198,8 +237,42 @@ def train(model, args):
         state_path, model, optimizer, lr_scheduler=lr_scheduler,
         curriculum=curriculum,
     )
+    warm_start_path = args.training.warm_start_model_checkpoint
+    if warm_start_path is not None and resume_state is None:
+        model.load_state_dict(torch.load(
+            warm_start_path, map_location=next(model.parameters()).device,
+            weights_only=True,
+        ))
+        print(
+            f"[warm-start] weights from {warm_start_path}; "
+            "optimizer, RNG, curriculum and step counter start fresh",
+            flush=True,
+        )
     n_dims = model.n_dims
     bsize = args.training.batch_size
+    discrete_position_fields = [
+        name
+        for name in ("loss_position_choices", "loss_position_set")
+        if getattr(args.training, name) not in (None, "")
+    ]
+    if discrete_position_fields:
+        if (
+            len(discrete_position_fields) > 1
+            or args.training.loss_positions not in (None, "")
+        ):
+            raise ValueError(
+                "loss_positions, loss_position_choices, and loss_position_set "
+                "are mutually exclusive"
+            )
+        if str(args.training.k_steps_for_loss) != "all":
+            raise ValueError(
+                f"{discrete_position_fields[0]} requires k_steps_for_loss=all"
+            )
+        parse_position_choices(
+            getattr(args.training, discrete_position_fields[0]),
+            args.training.curriculum.points.end,
+            field_name=discrete_position_fields[0],
+        )
     if args.training.data_transformation_args is not None:
         scale = sample_scale(
             method=args.training.data_transformation_args.get("method", None),
@@ -393,6 +466,8 @@ def train(model, args):
         else:
             ys = task.evaluate(xs)
 
+        task_ids = getattr(task, "task_ids", None)
+
         # end = time.time()
         # print("time",end - start)
         # outputs_list.append(ys)
@@ -412,6 +487,9 @@ def train(model, args):
             max_train_steps=args.training.train_steps,
             k_steps_for_loss=args.training.k_steps_for_loss,
             loss_positions=args.training.loss_positions,
+            loss_position_choices=args.training.loss_position_choices,
+            loss_position_set=args.training.loss_position_set,
+            task_ids=task_ids.cuda() if task_ids is not None else None,
             num_accum_steps=num_accum_steps,
             lr_scheduler=lr_scheduler,
         )
@@ -452,7 +530,8 @@ def train(model, args):
         log_loss += loss
         point_wise_tags = list(range(curriculum.n_points))
         point_wise_loss_func = task.get_metric()
-        point_wise_loss = point_wise_loss_func(output, ys.cuda()).mean(dim=0)
+        per_example_loss = point_wise_loss_func(output, ys.cuda())
+        point_wise_loss = per_example_loss.mean(dim=0)
         point_wise_loss = point_wise_loss/num_accum_steps
         log_point_wise_loss += point_wise_loss
 
@@ -470,8 +549,7 @@ def train(model, args):
             i+1 == args.training.train_steps) # log at the last train step
             and not args.test_run
         ):
-            wandb.log(
-                {
+            log_payload = {
                     "overall_loss": log_loss * loss_scaling_factor,
                     "excess_loss": log_loss * loss_scaling_factor / baseline_loss,
                     "pointwise/loss": dict(
@@ -482,19 +560,44 @@ def train(model, args):
                     "max_freq": curriculum.max_freq,
                     "rff_dim": curriculum.rff_dim,
                     "tasks_seen": (i + 1) * bsize,
-                    "objective/start": resolve_loss_range(
-                        curriculum.n_points,
-                        args.training.k_steps_for_loss,
-                        args.training.loss_positions,
-                    )[0],
-                    "objective/stop_exclusive": resolve_loss_range(
-                        curriculum.n_points,
-                        args.training.k_steps_for_loss,
-                        args.training.loss_positions,
-                    )[1],
-                },
-                step=(i+1)//num_accum_steps,
+                }
+            choices = parse_position_choices(
+                args.training.loss_position_choices, curriculum.n_points
             )
+            position_set = parse_position_choices(
+                args.training.loss_position_set,
+                curriculum.n_points,
+                field_name="loss_position_set",
+            )
+            if choices is None and position_set is None:
+                objective_range = resolve_loss_range(
+                    curriculum.n_points,
+                    args.training.k_steps_for_loss,
+                    args.training.loss_positions,
+                )
+                log_payload["objective/start"] = objective_range[0]
+                log_payload["objective/stop_exclusive"] = objective_range[1]
+            elif choices is not None:
+                log_payload["objective/position_choices"] = choices
+            else:
+                log_payload["objective/position_set"] = position_set
+
+            segment_offsets = getattr(task, "segment_offsets", None)
+            if segment_offsets is not None:
+                offsets_cuda = segment_offsets.to(per_example_loss.device)
+                for offset in range(1, int(offsets_cuda.max().item()) + 1):
+                    mask = offsets_cuda == offset
+                    log_payload[f"segment_offset/loss_{offset}"] = float(
+                        per_example_loss[mask].mean().detach().item()
+                    )
+                family_ids = task.family_ids.to(per_example_loss.device)
+                for family_id, family_name in enumerate(task.families):
+                    mask = family_ids == family_id
+                    log_payload[f"segment_family/{family_name}"] = float(
+                        per_example_loss[mask].mean().detach().item()
+                    )
+
+            wandb.log(log_payload, step=(i+1)//num_accum_steps)
 
         if (
             (i+1 == num_accum_steps or # first log when num_accum_steps are over -- this is equiv. to log at step=0 for non-accumulation training
@@ -662,6 +765,12 @@ def train(model, args):
             atomic_torch_save(
                 model.state_dict(),
                 os.path.join(args.out_dir, f"model_{one_indexed_steps}.pt"),
+            )
+            save_training_state(
+                os.path.join(args.out_dir, f"state_{one_indexed_steps}.pt"),
+                model, optimizer, i,
+                lr_scheduler=lr_scheduler, curriculum=curriculum,
+                data_sampler=data_sampler,
             )
         if (
             preemption.requested

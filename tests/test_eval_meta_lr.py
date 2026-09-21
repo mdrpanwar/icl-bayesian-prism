@@ -26,6 +26,28 @@ class ToyModel(torch.nn.Module):
 
 
 class EvalMetaLearningRateTests(unittest.TestCase):
+    def test_maml_baseline_drops_all_inner_loop_configuration(self):
+        baseline = object()
+        kwargs = {
+            "eval_mode": "maml",
+            "prompting_strategy": "standard",
+            "inner_lr": 0.002,
+            "inner_lr_mode": "learned_per_param",
+            "inner_lr_parameterization": "bounded_signed",
+            "inner_lr_bound": 0.05,
+            "num_inner_steps": 5,
+            "stride": 1,
+            "task_name": "linear_regression",
+        }
+        sentinel = object()
+        with patch.object(eval_module, "eval_model", return_value=sentinel) as mocked:
+            result = eval_module.compute_eval_metrics(baseline, kwargs)
+
+        self.assertIs(result, sentinel)
+        self.assertEqual(mocked.call_args.kwargs,
+                         {"prompting_strategy": "standard",
+                          "task_name": "linear_regression"})
+
     def test_bounded_inner_rates_are_reconstructed_for_offline_eval(self):
         model = ToyModel()
         config = Munch(
@@ -84,6 +106,12 @@ class EvalMetaLearningRateTests(unittest.TestCase):
         self.assertEqual(maml["inner_lr_mode"], "learned_per_param")
         self.assertEqual(maml["inner_lr_parameterization"], "bounded_signed")
         self.assertEqual(maml["inner_lr_bound"], 0.05)
+
+        conf.training.data_kwargs = {"mean": 2.0}
+        conf.training.task_kwargs = {"num_functions": 3}
+        maml = eval_module.build_evals(conf)["maml"]
+        self.assertEqual(maml["data_sampler_kwargs"], {"mean": 2.0})
+        self.assertEqual(maml["task_sampler_kwargs"], {"num_functions": 3})
 
 
 if __name__ == "__main__":

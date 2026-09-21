@@ -219,13 +219,17 @@ def inner_adapt(
     num_inner_steps,
     first_order,
     loss_func,
+    task_ids_support=None,
 ):
     """Run inner-loop gradient updates on independent support examples."""
     fast_params = init_params
     for _ in range(num_inner_steps):
         xs_batch = xs_support.reshape(-1, 1, xs_support.shape[-1])
         ys_batch = ys_support.reshape(-1, 1)
-        preds = functional_call(model, fast_params, (xs_batch, ys_batch))
+        kwargs = None
+        if task_ids_support is not None:
+            kwargs = {"task_ids": task_ids_support.reshape(-1, 1)}
+        preds = functional_call(model, fast_params, (xs_batch, ys_batch), kwargs)
         loss_s = loss_func(preds, ys_batch)
         grads = torch.autograd.grad(
             loss_s,

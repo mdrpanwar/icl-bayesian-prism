@@ -34,6 +34,15 @@ model_schema = {
     # Keep each prediction/query point independent: it can attend to the
     # conditioning prefix and its own x/y tokens, but not to other queries.
     "isolate_query_points": merge(tboolean, default(False)),
+    # Optional per-example task/function identities. When positive, the model
+    # adds a learned task-slot embedding to both tokens of every (x, y) pair.
+    "num_task_slots": merge(tinteger, default(0)),
+    # additive is the earlier pilot; prefix_token makes [tag,x,y] triplets.
+    # none ignores IDs and retains the slot table for a parameter-matched
+    # untagged control.
+    "task_tag_mode": merge(
+        tstring, allowed(["additive", "prefix_token", "none"]), default("additive")
+    ),
 
     "attention_mode": merge(
         tstring,
@@ -97,6 +106,8 @@ TASK_LIST = [
     "haar_wavelets",
     "noisy_lr_task_diversity",
     "fourier_series_multitask",
+    "multi_function_linear",
+    "segmented_pretraining",
 ]
 
 training_schema = {
@@ -117,11 +128,18 @@ training_schema = {
     "keep_every_steps": merge(tinteger, default(-1)),  # permanent checkpoints
     "eval_ood": merge(tboolean, default(False)),
     "resume_id": merge(tstring, nullable, default(None)),  # run uuid64
+    "warm_start_model_checkpoint": merge(tstring, nullable, default(None)),
     "curriculum": stdict(curriculum_schema),
     "k_steps_for_loss": merge(tstring, default("all")),
     # Optional zero-based selector: all, last:N, or range:START:STOP (STOP exclusive).
     # When set, k_steps_for_loss must remain "all".
     "loss_positions": merge(tstring, nullable, default(None)),
+    # Optional comma-separated zero-based query positions. One position is
+    # sampled independently for every row of a training batch.
+    "loss_position_choices": merge(tstring, nullable, default(None)),
+    # Optional comma-separated zero-based query positions. Every position is
+    # supervised in every sequence and their losses are averaged together.
+    "loss_position_set": merge(tstring, nullable, default(None)),
     "eval_n_points": merge(tinteger, nullable, default(None)),
     "seed": merge(tinteger, default(0)),
     "num_accum_steps": merge(tinteger, default(1)), # number of gradient accumulation steps; we take an optimizer step every num_accum_steps steps
@@ -169,6 +187,7 @@ meta_schema = {
     ),
     "inner_lr_bound": merge(tfloat, nullable, default(None)),
     "outer_grad_clip_norm": merge(tfloat, nullable, default(None)),
+    "max_outer_grad_norm_before_skip": merge(tfloat, nullable, default(None)),
     "fail_on_nonfinite": merge(tboolean, default(False)),
     "num_inner_steps": merge(tinteger, default(1)),
     "first_order": merge(tboolean, default(False)),
@@ -176,10 +195,17 @@ meta_schema = {
     "num_query_points": merge(tinteger, default(10)),
     "vary_support_size": merge(
         tstring,
-        allowed(["match_curriculum", "full_range", "fixed"]),
+        allowed([
+            "match_curriculum", "full_range", "fixed", "choices",
+            "choices_parallel", "choices_sequential",
+        ]),
         default("match_curriculum"),
     ),
     "fixed_support_size": merge(tinteger, nullable, default(None)),
+    # Comma-separated support sizes used by all three choices modes. `choices`
+    # samples one k; `choices_parallel` adapts independently at every k;
+    # `choices_sequential` carries fast parameters through the sorted k values.
+    "support_size_choices": merge(tstring, nullable, default(None)),
     "multi_k_support": merge(tboolean, default(False)),
     "meta_eval_every_steps": merge(tinteger, default(5000)),
     "meta_eval_stride": merge(tinteger, default(1)),

@@ -95,6 +95,8 @@ def get_task_sampler(
         "uniform_mixture_linear_regression": UniformPriorMixLinearRegression,
         "haar_wavelets": HaarWavelets,
         "fourier_series_multitask": FourierSeriesV2Multitask,
+        "multi_function_linear": MultiFunctionLinearRegression,
+        "segmented_pretraining": SegmentedPretraining,
     }
     if task_name in task_names_to_classes:
         task_cls = task_names_to_classes[task_name]
@@ -168,6 +170,177 @@ class LinearRegression(Task):
     @staticmethod
     def generate_pool_dict(n_dims, num_tasks, **kwargs):  # ignore extra args
         return {"w": torch.randn(num_tasks, n_dims, 1)}
+
+    @staticmethod
+    def get_metric():
+        return squared_error
+
+    @staticmethod
+    def get_training_metric():
+        return mean_squared_error
+
+
+class MultiFunctionLinearRegression(Task):
+    """Several independent linear functions in one tagged episode."""
+
+    def __init__(
+        self,
+        n_dims,
+        batch_size,
+        pool_dict=None,
+        seeds=None,
+        num_functions=1,
+        support_per_function=5,
+    ):
+        super().__init__(n_dims, batch_size, pool_dict, seeds)
+        if pool_dict is not None or seeds is not None:
+            raise NotImplementedError(
+                "multi-function episodes currently sample fresh functions"
+            )
+        self.num_functions = int(num_functions)
+        self.support_per_function = int(support_per_function)
+        if self.num_functions <= 0 or self.support_per_function <= 0:
+            raise ValueError("num_functions and support_per_function must be positive")
+        self.weights = torch.randn(batch_size, self.num_functions, n_dims)
+        self.task_ids = None
+
+    def evaluate(self, xs_b):
+        expected = self.num_functions * (self.support_per_function + 1)
+        if xs_b.shape[1] != expected:
+            raise ValueError(
+                f"multi-function episode needs {expected} positions, "
+                f"got {xs_b.shape[1]}"
+            )
+
+        support_template = torch.arange(self.num_functions).repeat_interleave(
+            self.support_per_function
+        )
+        ids = []
+        for _ in range(xs_b.shape[0]):
+            support_ids = support_template[torch.randperm(len(support_template))]
+            query_ids = torch.randperm(self.num_functions)
+            ids.append(torch.cat((support_ids, query_ids)))
+        self.task_ids = torch.stack(ids)
+
+        weights = self.weights.to(xs_b.device)
+        task_ids = self.task_ids.to(xs_b.device)
+        selected_weights = torch.gather(
+            weights,
+            1,
+            task_ids.unsqueeze(-1).expand(-1, -1, self.n_dims),
+        )
+        return (xs_b * selected_weights).sum(dim=-1)
+
+    @staticmethod
+    def get_metric():
+        return squared_error
+
+    @staticmethod
+    def get_training_metric():
+        return mean_squared_error
+
+
+class SegmentedPretraining(Task):
+    """Unmarked 1--5-example segments drawn from heterogeneous functions."""
+
+    DEFAULT_FAMILIES = (
+        "coordinate_affine",
+        "coordinate_offset",
+        "coordinate_quadratic",
+        "decision_stump",
+        "linear_regression",
+        "decision_tree",
+    )
+
+    def __init__(
+        self,
+        n_dims,
+        batch_size,
+        pool_dict=None,
+        seeds=None,
+        min_segment_length=1,
+        max_segment_length=5,
+        families=None,
+        decision_tree_depth=4,
+    ):
+        super().__init__(n_dims, batch_size, pool_dict, seeds)
+        if pool_dict is not None or seeds is not None:
+            raise NotImplementedError(
+                "segmented pretraining currently samples fresh functions"
+            )
+        self.min_segment_length = int(min_segment_length)
+        self.max_segment_length = int(max_segment_length)
+        if not 1 <= self.min_segment_length <= self.max_segment_length:
+            raise ValueError("invalid segment-length interval")
+        self.families = tuple(families or self.DEFAULT_FAMILIES)
+        unknown = set(self.families) - set(self.DEFAULT_FAMILIES)
+        if unknown:
+            raise ValueError(f"unknown segmented families: {sorted(unknown)}")
+        self.decision_tree_depth = int(decision_tree_depth)
+        self.segment_offsets = None
+        self.family_ids = None
+
+    def _sample_function(self, family, xs):
+        d = xs.shape[-1]
+        j = int(torch.randint(d, (1,)).item())
+        if family == "coordinate_affine":
+            a, b = torch.randn(2)
+            return (a * xs[:, j] + b) / math.sqrt(2)
+        if family == "coordinate_offset":
+            k = torch.randn(())
+            return (xs[:, j] + k) / math.sqrt(2)
+        if family == "coordinate_quadratic":
+            a, b = torch.randn(2)
+            phi = (xs[:, j].square() - 1) / math.sqrt(2)
+            return (a * phi + b) / math.sqrt(2)
+        if family == "decision_stump":
+            leaves = torch.randn(2)
+            return torch.where(xs[:, j] > 0, leaves[1], leaves[0])
+        if family == "linear_regression":
+            w = torch.randn(d) / math.sqrt(d)
+            return xs @ w
+        if family == "decision_tree":
+            depth = self.decision_tree_depth
+            split_coords = torch.randint(d, (2**depth - 1,))
+            leaves = torch.randn(2**depth)
+            nodes = torch.zeros(xs.shape[0], dtype=torch.long)
+            for _ in range(depth):
+                decisions = xs[
+                    torch.arange(xs.shape[0]), split_coords[nodes]
+                ] > 0
+                nodes = 2 * nodes + 1 + decisions.long()
+            return leaves[nodes - (2**depth - 1)]
+        raise AssertionError(f"unhandled family {family}")
+
+    def evaluate(self, xs_b):
+        batch_size, n_points, _ = xs_b.shape
+        ys = torch.empty(batch_size, n_points, dtype=xs_b.dtype)
+        offsets = torch.empty(batch_size, n_points, dtype=torch.long)
+        family_ids = torch.empty(batch_size, n_points, dtype=torch.long)
+
+        for row in range(batch_size):
+            start = 0
+            while start < n_points:
+                length = int(
+                    torch.randint(
+                        self.min_segment_length,
+                        self.max_segment_length + 1,
+                        (1,),
+                    ).item()
+                )
+                stop = min(start + length, n_points)
+                family_id = int(torch.randint(len(self.families), (1,)).item())
+                family = self.families[family_id]
+                ys[row, start:stop] = self._sample_function(
+                    family, xs_b[row, start:stop]
+                )
+                offsets[row, start:stop] = torch.arange(1, stop - start + 1)
+                family_ids[row, start:stop] = family_id
+                start = stop
+
+        self.segment_offsets = offsets
+        self.family_ids = family_ids
+        return ys
 
     @staticmethod
     def get_metric():
@@ -2363,4 +2536,3 @@ class HaarWavelets(Task):
     @staticmethod
     def get_training_metric():
         return mean_squared_error    
-
